@@ -46,10 +46,15 @@ xml() {
 
 plist() {
   # 使うコマンドは確かめた絶対パスで渡し、PATH からは探させない
-  local node claude gog
+  local node claude gog gh gclouda gcloud tool_path
   node=$(resolve_bin node)
   claude=$(resolve_bin claude)
   gog=$(resolve_bin gog)
+  # 確認ステップで GitHub と GCP を読む時に使う（scripts/external-mcp.mjs）
+  gh=$(resolve_bin gh)
+  gclouda=$(resolve_bin gclouda)
+  gcloud=$(resolve_bin gcloud)
+  tool_path="$(dirname "$gcloud"):$(dirname "$gh"):/usr/bin:/bin"
   cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -69,6 +74,9 @@ plist() {
     <key>REPLY_WATCH_NODE</key><string>$(xml "$node")</string>
     <key>REPLY_WATCH_CLAUDE</key><string>$(xml "$claude")</string>
     <key>REPLY_WATCH_GOG</key><string>$(xml "$gog")</string>
+    <key>REPLY_WATCH_GH</key><string>$(xml "$gh")</string>
+    <key>REPLY_WATCH_GCLOUDA</key><string>$(xml "$gclouda")</string>
+    <key>REPLY_WATCH_TOOL_PATH</key><string>$(xml "$tool_path")</string>
   </dict>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><true/>

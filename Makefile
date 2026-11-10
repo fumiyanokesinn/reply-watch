@@ -3,6 +3,7 @@
 test:
 	node test/mock_run.js
 	REPLY_WATCH_QUIET=1 node test/local_ai_test.mjs
+	node test/external_mcp_test.mjs
 
 # 仕分けプロンプトを合成データで実際の Claude Code に判定させる（プランの利用枠を使う）
 eval:

@@ -148,6 +148,9 @@ const { scan, notify_, COLS, STATE } = api;
 api.CFG.INCLUDE_DM = true; // DM を含めた流れを先に確かめ、最後に外した場合を確かめる
 const table = () => Object.fromEntries(grids.threads.slice(1).map((r) => [r[0], Object.fromEntries(COLS.map((c, i) => [c, r[i]]))]));
 
+// 判定時刻（judgments の judged_at）。固定した現在時刻を日本時間の文字列にしたもの
+const JNOW = new Date(FIXED + 9 * 36e5).toISOString().slice(0, 19).replace('T', ' ');
+
 // Mac 側の仕分けの代役: 判定待ちを読み、本文の決め打ちで judgments シートに追記する。
 function localJudge() {
   let n = 0;
@@ -165,12 +168,13 @@ function localJudge() {
     const due = new Date(FIXED + 19 * 36e5).toISOString().slice(0, 16).replace('T', ' ');
     const next = state === 'UNREPLIED' || state === 'PROMISED' ? '返信する' : '';
     const pr = text.includes('PR #77') ? 'REVIEW_TO_ME' : 'OTHER';
-    grids.judgments.push([r.key, r.pending_fp, state, `要約(${state})`, '根拠', next, state === 'PROMISED' ? due : '', '', pr]);
+    grids.judgments.push([r.key, r.pending_fp, state, `要約(${state})`, '根拠', next, state === 'PROMISED' ? due : '', JNOW, pr, 5, '', '確認で書いたボール', 'NOT_STARTED']);
     n++;
   });
   return n;
 }
 
+// 0) scan は meta シートに判定の版を出す（Mac 側が照合する）
 // 1) 初回の収集: AI が要る 6 件は判定待ちになるだけで、状態はまだ付かない。bot だけの DM は規則で対応不要。
 //    通知チャンネルの投稿は拾わない。GAS からの通信先は Slack だけ。
 scan();
@@ -180,6 +184,7 @@ assert.strictEqual(Object.values(t).filter((r) => r.pending_fp).length, 6);
 assert.strictEqual(t[`C1:${T.ask}`].state, '');
 assert.strictEqual(t['D1:dm'].state, STATE.NO_ACTION);
 assert.deepStrictEqual([...new Set(calls.external)], ['slack.com']);
+assert.deepStrictEqual(JSON.parse(JSON.stringify(grids.meta[1])), ['judge_version', api.CFG.JUDGE_VERSION]);
 
 // 2) 判定がまだ無い間は、再実行しても判定待ちのまま読み直さない（Mac が止まっていても Slack を叩き続けない）。
 calls.replies = 0;
@@ -205,13 +210,13 @@ assert.strictEqual(Object.values(t).filter((r) => r.pending_fp || r.pending_inpu
 assert.deepStrictEqual(grids.threads.slice(1, 4).map((r) => r[COLS.indexOf('priority')]), ['高', '中', '中']);
 
 // 4) 通知: Mac 側が書いた一文があればそれを、無ければ定型文を使う。期限が近い件が先頭。2 回目は投稿しない。
-grids.notices.push([`C1:${T.ask}`, t[`C1:${T.ask}`].fingerprint, 'AI: 依頼を確認して返信', '']);
+grids.notices.push([`C1:${T.ask}`, `${t[`C1:${T.ask}`].fingerprint}#${t[`C1:${T.ask}`].state}#${t[`C1:${T.ask}`].ball}`, 'AI: 依頼を確認して返信', '']);
 grids.notices.push([`C1:${T.promiseRoot}`, '古い内容の指紋', 'AI: 古い一文', '']);
 const stale = api.isDueForStale_;
 notify_('stale', stale);
 assert.strictEqual(posted.length, 1);
 assert.strictEqual(posted[0].channel, 'CNOTIFY');
-const out = posted[0].text.split('\n');
+const out = posted[0].text.split('\n').filter((l) => !l.startsWith('　　ボール: '));
 // 2 時間前のグループメンションは放置時間に達していないので載らない
 const heads = [`<@${ME}> *自分の対応待ち 2 件*`, '• [高] 要約(PROMISED) → 返信する', '• [中] AI: 依頼を確認して返信', '*相手待ち（催促候補） 1 件*', '• [中] 要約(WAITING_OTHERS) → 催促する'];
 assert.strictEqual(out.length, heads.length);
@@ -220,6 +225,11 @@ assert.ok(out[1].includes('期限 '));
 notify_('stale', stale);
 assert.strictEqual(posted.length, 1);
 assert.strictEqual(table()[`C1:${T.ask}`].notify_count, 1);
+
+// 各件の下に、本人が持っているボール（確認で分かったもの、なければ次にやること）が付く
+assert.ok(posted[0].text.includes('\n　　ボール: 【未着手】返信する'));
+// 確認ステップの ball（シートだけ）は通知に出ない
+assert.ok(!posted[0].text.includes('確認で書いたボール'));
 
 // 4b) 対応がないまま 4 時間経つと、その件だけもう一度知らせる。再通知は 1 回まで。
 const backdate = (key, hours) => {
@@ -232,7 +242,7 @@ assert.strictEqual(posted.length, 1);
 backdate(`C1:${T.ask}`, 5);
 notify_('stale', stale);
 assert.strictEqual(posted.length, 2);
-assert.strictEqual(posted[1].text.split('\n').length, 2);
+assert.strictEqual(posted[1].text.split('\n').filter((l) => !l.startsWith('　　ボール: ')).length, 2);
 assert.ok(posted[1].text.includes('依頼を確認して返信'));
 assert.strictEqual(table()[`C1:${T.ask}`].renotify_count, 1);
 backdate(`C1:${T.ask}`, 5);
@@ -268,8 +278,8 @@ assert.strictEqual(table()[`C3:${T.waitRoot}`].state, STATE.WAITING_OTHERS);
 threads[`C2:${T.doneRoot}`].push({ user: 'UC', text: '再依頼: 別の URL もください', ts: T.more });
 extraMentions.push({ channel: { id: 'C2' }, ts: T.more, permalink: `https://x.slack.com/archives/C2/p1?thread_ts=${T.doneRoot}` });
 scan();
-grids.judgments.push([`C2:${T.doneRoot}`, '古い内容の指紋', 'NO_ACTION', 'x', 'x', '', '', '', 'OTHER']);
-grids.judgments.push([`C2:${T.doneRoot}`, table()[`C2:${T.doneRoot}`].pending_fp, 'BOGUS', 'x', 'x', '', '', '', 'OTHER']);
+grids.judgments.push([`C2:${T.doneRoot}`, '古い内容の指紋', 'NO_ACTION', 'x', 'x', '', '', JNOW, 'OTHER', 5]);
+grids.judgments.push([`C2:${T.doneRoot}`, table()[`C2:${T.doneRoot}`].pending_fp, 'BOGUS', 'x', 'x', '', '', JNOW, 'OTHER', 5]);
 scan();
 assert.strictEqual(table()[`C2:${T.doneRoot}`].state, STATE.DONE);
 assert.ok(table()[`C2:${T.doneRoot}`].pending_fp);
@@ -311,7 +321,7 @@ assert.ok(fitted[1].omitted_messages > 0);
 // 朝のまとめ: 自分の対応待ち 3 件。催促し直した相手待ちは載らない。
 notify_('digest', (row, nowMs) => api.isMine_(row) || api.isRipe_(row, nowMs));
 assert.strictEqual(posted.length, 3);
-assert.strictEqual(posted[2].text.split('\n').length, 4);
+assert.strictEqual(posted[2].text.split('\n').filter((l) => !l.startsWith('　　ボール: ')).length, 4);
 // 朝のまとめに載ると、その日の再通知は数え直す
 assert.strictEqual(table()[`C1:${T.promiseRoot}`].renotify_count, 0);
 
@@ -339,7 +349,7 @@ grids.judgments.push([prKey, table()[prKey].pending_fp, 'DONE', 'x', 'x', '', ''
 scan();
 assert.ok(table()[prKey].pending_fp);
 threads[prKey][0].text += ' PR #77 のレビューお願いします';
-grids.judgments.push([prKey, table()[prKey].pending_fp, 'PROMISED', 'PR のレビュー', 'r', '見る', '', '', 'REVIEW_TO_ME']);
+grids.judgments.push([prKey, table()[prKey].pending_fp, 'PROMISED', 'PR のレビュー', 'r', '見る', '', JNOW, 'REVIEW_TO_ME', 5]);
 scan();
 t = table();
 assert.strictEqual(t[prKey].pending_fp, '');
@@ -347,6 +357,41 @@ assert.strictEqual(t[prKey].priority, '対象外');
 calls.replies = 0;
 notify_('digest', () => true);
 assert.ok(!posted.at(-1).text.includes('PR のレビュー'));
+
+// 12b) 判定の版が上がると、対応が残っている件は内容が同じでも判定し直し、版の違う判定は取り込まない
+const vKey = `C4:${T.group}`;
+assert.strictEqual(String(table()[vKey].judge_version), '5');
+api.CFG.JUDGE_VERSION = 6;
+scan();
+assert.ok(table()[vKey].pending_fp, '版が上がると判定し直しに回る');
+grids.judgments.push([vKey, table()[vKey].pending_fp, 'NO_ACTION', 'x', 'x', '', '', JNOW, 'OTHER', 5]);
+scan();
+assert.strictEqual(table()[vKey].state, STATE.UNREPLIED, '古い版の判定は取り込まない');
+grids.judgments.push([vKey, table()[vKey].pending_fp, 'NO_ACTION', '他の人が対応済み', 'x', '', '', JNOW, 'OTHER', 6]);
+scan();
+assert.strictEqual(table()[vKey].state, STATE.NO_ACTION);
+api.CFG.JUDGE_VERSION = 5;
+
+// 12c) 対応が残っている件は、判定から REVERIFY_HOURS 経つと同じ内容でも判定し直しに回る。
+//      判定し直しに回す前の判定は取り込まず、その後の判定だけを取り込む
+const rKey = `C3:${T.waitRoot}`;
+const rRow = grids.threads.find((r) => r[0] === rKey);
+rRow[COLS.indexOf('judged_at')] = new Date(FIXED - 25 * 36e5);
+rRow[COLS.indexOf('pending_fp')] = '';
+rRow[COLS.indexOf('pending_input')] = '';
+rRow[COLS.indexOf('pending_at')] = '';
+// 時刻を止めたテストなので、この件の前の判定は「25 時間前」のものに書き換える
+grids.judgments.forEach((r) => { if (r[0] === rKey) r[7] = new Date(FIXED + 9 * 36e5 - 25 * 36e5).toISOString().slice(0, 19).replace('T', ' '); });
+scan();
+assert.ok(table()[rKey].pending_fp, '24 時間を過ぎた判定は調べ直しに回る');
+grids.judgments.push([rKey, table()[rKey].pending_fp, 'DONE', 'x', 'x', '', '',
+  new Date(FIXED + 9 * 36e5 - 60 * 1000).toISOString().slice(0, 19).replace('T', ' '), 'OTHER', 5]);
+scan();
+assert.ok(table()[rKey].pending_fp, '回す前の判定は取り込まない');
+grids.judgments.push([rKey, table()[rKey].pending_fp, 'DONE', '別スレで解決済み', 'x', '', '', JNOW, 'OTHER', 5, '11/09 に別スレで合意']);
+scan();
+assert.strictEqual(table()[rKey].state, STATE.DONE);
+assert.strictEqual(table()[rKey].verify_note, '11/09 に別スレで合意');
 
 // 13) EXCLUDE_BOT_IDS の bot が始めたスレッドは、AI に回さず対応不要にする（bot ID でも bot のユーザー ID でも）
 //     設定を後から足した場合も、判定済みの未完了の件や判定待ちに効く。人のユーザー ID や本人の ID は除外しない
@@ -374,7 +419,7 @@ t = table();
   assert.strictEqual(t[k].pending_input, '', k);
 });
 // UA（人）が始めた C4 のグループ宛てスレッドは、UA を書いても除外されない
-assert.notStrictEqual(t[`C4:${T.group}`].state, STATE.NO_ACTION);
+assert.notStrictEqual(t[`C3:${T.waitRoot}`].state, STATE.NO_ACTION);
 delete props.EXCLUDE_BOT_IDS;
 
 // 14) 判定待ちのまま PENDING_TTL_HOURS を過ぎた本文は消える
@@ -437,7 +482,7 @@ assert.strictEqual(t['G5:9.9'].dm, true);
 assert.strictEqual(t['G5:9.9'].priority, '対象外');
 // 判別できていない古い行も、分かるまでは対象外。普通のスレッドと分かっている行は対象のまま
 assert.strictEqual(api.priority_({ key: 'C8:1.1', kind: 'thread', dm: '', state: STATE.UNREPLIED, pending_since: new Date(FIXED), due_at: '' }, FIXED), '対象外');
-assert.notStrictEqual(t[`C4:${T.group}`].priority, '対象外');
+assert.notStrictEqual(t[`C3:${T.waitRoot}`].priority, '対象外');
 const recent = new Date(FIXED - 5 * 36e5);
 const dmRows = [
   { key: 'D9:dm', kind: 'dm', dm: false },

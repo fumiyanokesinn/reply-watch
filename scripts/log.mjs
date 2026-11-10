@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
 const MAX_BYTES = 5 * 1024 * 1024; // これを超えたら .1 に回す（.1 は 1 世代だけ残す）
-const SESSIONS = ['judge', 'notice'];
+const SESSIONS = ['judge', 'verify', 'notice'];
 
 export function logDir() {
   return resolve(process.env.REPLY_WATCH_LOG_DIR || join(homedir(), 'Library/Logs/reply-watch'));

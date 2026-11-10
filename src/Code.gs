@@ -18,6 +18,10 @@
 const CFG = {
   // 本人が PR のレビューを頼まれている件を対象外にする（別のアラートで扱う）。本人が頼んだ側の件は対象のまま
   EXCLUDE_PR_REVIEW: true,
+  // 判定の版。prompts/judge.md の基準を変えたら上げる（scripts/local-ai.mjs の JUDGE_VERSION と揃える）。
+  // 版の違う判定は取り込まず、対応が残っている件は判定し直す
+  JUDGE_VERSION: 5,
+  REVERIFY_HOURS: 24, // 対応が残っている件は、判定からこの時間が経つと Slack を調べ直す（scripts/local-ai.mjs と揃える）
   INCLUDE_DM: false, // DM（グループ DM 含む）を対象にするか。false の間は拾わず、既にある DM の件も追跡・通知しない
   DONE_REACTIONS: ['done', 'white_check_mark'], // 本人が付けたら対応完了として扱うリアクション
   LOOKBACK_DAYS: 14, // 新規に拾う範囲（追跡を打ち切る GIVE_UP_DAYS と揃える）
@@ -62,14 +66,20 @@ const EXCLUDED = '対象外';
 const PR_TO_ME = 'REVIEW_TO_ME';
 const PR_OTHER = 'OTHER';
 const PR_VALUES = [PR_TO_ME, PR_OTHER];
+// 必要な対応の種類（scripts/local-ai.mjs の ACTION_TYPES と同じ）と、通知での表示
+const ACTION_LABELS = {
+  REPLY_ONLY: '返事だけ', NOT_STARTED: '未着手', IN_PROGRESS: '作業中', REPORT_ONLY: '完了報告だけ', NUDGE: '催促',
+};
 
 const COLS = [
   'key', 'kind', 'permalink', 'state', 'priority', 'summary', 'reason', 'next_action',
   'due_at', 'pending_since', 'latest_ts', 'fingerprint', 'judged_at', 'checked_at',
-  'last_notified_at', 'notify_count', 'mute', 'pending_fp', 'pending_input', 'renotify_count', 'dm', 'pr_review', 'pending_at',
+  'last_notified_at', 'notify_count', 'mute', 'pending_fp', 'pending_input', 'renotify_count', 'dm', 'pr_review', 'pending_at', 'judge_version', 'verify_note', 'ball', 'action_type',
 ];
-const JUDGMENT_COLS = ['key', 'fingerprint', 'state', 'summary', 'reason', 'next_action', 'due_at', 'judged_at', 'pr_review'];
+const JUDGMENT_COLS = ['key', 'fingerprint', 'state', 'summary', 'reason', 'next_action', 'due_at', 'judged_at', 'pr_review', 'judge_version', 'verify_note', 'ball', 'action_type'];
 const NOTICE_COLS = ['key', 'fingerprint', 'line', 'written_at'];
+const META_SHEET = 'meta'; // GAS が書き、Mac 側が読む設定（判定の版など）
+const META_COLS = ['name', 'value'];
 
 // ───────────────────────── 収集（GAS） ─────────────────────────
 
@@ -85,6 +95,7 @@ function scan() {
   };
   try {
     ensureSheet_(CFG.NOTICES_SHEET, NOTICE_COLS); // Mac 側が追記できるよう先に用意しておく
+    writeMeta_();
     stat.判定取り込み = applyJudgments_(store);
     const me = myUserId_();
     const groups = myGroups_(me);
@@ -176,9 +187,11 @@ function applyJudgments_(store) {
   let applied = 0;
   readRows_(CFG.JUDGMENTS_SHEET, JUDGMENT_COLS).forEach((j) => {
     // pr_review の無い（または形式の違う）判定は古い版の結果。取り込むと判定し直しが終わらないので使わない
-    if (PR_VALUES.indexOf(j.pr_review) < 0) return;
+    if (PR_VALUES.indexOf(j.pr_review) < 0 || String(j.judge_version) !== String(CFG.JUDGE_VERSION)) return;
     const row = store.get(j.key);
     if (!row || !row.pending_fp || row.pending_fp !== j.fingerprint) return;
+    // 判定し直しに回した後の判定だけを使う（同じ内容に対する前の判定を取り込まない）
+    if (row.pending_at && jstMs_(j.judged_at) + 1000 < toMs_(row.pending_at)) return;
     try {
       applyJudgment_(row, j.fingerprint, j);
       applied++;
@@ -349,6 +362,10 @@ function renderMessages_(messages, me, outsideThread) {
     if (m.files && m.files.length) item.has_files = true;
     const mine = (m.reactions || []).filter((r) => (r.users || []).indexOf(me) >= 0).map((r) => r.name);
     if (mine.length) item.reactions_by_me = mine;
+    // 本人以外のリアクション（了承の返事として扱えるように、名前と人数だけ）
+    const others = (m.reactions || []).map((r) => ({ name: r.name, count: (r.users || []).filter((u) => u !== me).length }))
+      .filter((r) => r.count > 0);
+    if (others.length) item.reactions_by_others = others;
     if (outsideThread) item.outside_thread = true;
     return item;
   });
@@ -393,6 +410,10 @@ function applyJudgment_(row, fingerprint, j) {
   }
   row.due_at = parseDue_(j.due_at);
   row.pr_review = j.pr_review;
+  row.judge_version = j.judge_version || CFG.JUDGE_VERSION;
+  row.verify_note = String(j.verify_note || '').slice(0, 300);
+  row.ball = isOpen_(row) ? String(j.ball || j.next_action || '').slice(0, 200) : '';
+  row.action_type = isOpen_(row) && ACTION_LABELS[j.action_type] ? j.action_type : '';
   row.priority = priority_(row, Date.now());
 }
 
@@ -432,7 +453,16 @@ function isExcluded_(row) {
 
 /** 対応が残っていて、まだ「本人への PR レビュー依頼か」を今の基準で判定していない件。 */
 function needsRejudge_(row) {
-  return isOpen_(row) && !isExcluded_(row) && PR_VALUES.indexOf(row.pr_review) < 0;
+  return isOpen_(row) && !isExcluded_(row) &&
+    (PR_VALUES.indexOf(row.pr_review) < 0 || String(row.judge_version) !== String(CFG.JUDGE_VERSION) ||
+     Date.now() - toMs_(row.judged_at) > CFG.REVERIFY_HOURS * 36e5);
+}
+
+/** judgments の judged_at（「yyyy-MM-dd HH:mm[:ss]」日本時間の文字列、または Date）をミリ秒にする。 */
+function jstMs_(v) {
+  if (v instanceof Date) return v.getTime();
+  const m = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})(:\d{2})?$/.exec(String(v || ''));
+  return m ? new Date(`${m[1]}T${m[2]}${m[3] || ':00'}+09:00`).getTime() : 0;
 }
 
 /**
@@ -549,13 +579,17 @@ function composeNotice_(allRows, nowMs) {
   const due = (r) => (r.due_at ? Utilities.formatDate(new Date(toMs_(r.due_at)), CFG.TZ, 'MM/dd HH:mm') : '');
   const written = new Map();
   readRows_(CFG.NOTICES_SHEET, NOTICE_COLS).forEach((n) => written.set(`${n.key}|${n.fingerprint}`, n.line));
-  const line = (r) => written.get(`${r.key}|${r.fingerprint}`) ||
+  const line = (r) => written.get(`${r.key}|${noticeId_(r)}`) ||
     `${r.summary} → ${r.next_action || (isMine_(r) ? '対応する' : '催促する')}`;
   const render = (r) => {
     const h = hours(r);
     const meta = [r.state, h >= 48 ? `${Math.floor(h / 24)}営業日経過` : `${h}時間経過`];
     if (due(r)) meta.push(`期限 ${due(r)}`);
-    return `• [${priority_(r, nowMs)}] ${cleanLine_(line(r))}（${meta.join('・')}）${link_(r.permalink)}`;
+    // 確認ステップの ball は他のチャンネルや DM を読んで書かれうるので、公開の通知には出さない（シートにだけ残す）。
+    // 通知には、元のスレッドだけを読んだ一次判定の next_action と、決まった値の対応の種類だけを出す
+    const ball = r.next_action;
+    return `• [${priority_(r, nowMs)}] ${cleanLine_(line(r))}（${meta.join('・')}）${link_(r.permalink)}` +
+      (ball ? `\n　　ボール: ${ACTION_LABELS[r.action_type] ? `【${ACTION_LABELS[r.action_type]}】` : ''}${cleanLine_(ball)}` : '');
   };
   const mine = rows.filter(isMine_);
   const waiting = rows.filter((r) => !isMine_(r));
@@ -564,6 +598,11 @@ function composeNotice_(allRows, nowMs) {
   if (waiting.length) parts.push(`*相手待ち（催促候補） ${waiting.length} 件*`, ...waiting.map(render));
   if (sorted.length > rows.length) parts.push(`他 ${sorted.length - rows.length} 件はシートを参照`);
   return parts.join('\n');
+}
+
+/** 通知文を作った時の判定を表す識別子。scripts/local-ai.mjs の noticeId と同じ形。 */
+function noticeId_(r) {
+  return `${r.fingerprint}#${r.state}#${r.ball || ''}`;
 }
 
 /** 優先度の高い順、同じなら長く止まっている順。 */
@@ -632,6 +671,11 @@ function ensureSheet_(name, cols) {
     if (cols.some((c, i) => header[i] !== c)) sheet.getRange(1, 1, 1, cols.length).setValues([cols]);
   }
   return sheet;
+}
+
+/** Mac 側に合わせてほしい設定を meta シートに出す（版がずれた Mac 側は判定せずにエラーを出す）。 */
+function writeMeta_() {
+  ensureSheet_(META_SHEET, META_COLS).getRange(2, 1, 1, 2).setValues([['judge_version', CFG.JUDGE_VERSION]]);
 }
 
 /** Mac 側が追記するシートを読む（GAS からは書かない）。 */

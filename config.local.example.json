@@ -1,0 +1,8 @@
+{
+  "github_orgs": ["your-org"],
+  "gcp_projects": {
+    "prod": "your-prod-project-id",
+    "stg": "your-stg-project-id",
+    "dev": "your-dev-project-id"
+  }
+}
