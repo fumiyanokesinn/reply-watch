@@ -1,0 +1,32 @@
+{
+  "display_information": {
+    "name": "reply-watch",
+    "description": "未返信・対応未完了のリマインド"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "reply-watch",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "user": [
+        "search:read",
+        "channels:history",
+        "groups:history",
+        "im:history",
+        "mpim:history",
+        "usergroups:read"
+      ],
+      "bot": [
+        "chat:write"
+      ]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
