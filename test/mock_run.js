@@ -4,7 +4,9 @@ const vm = require('vm');
 const assert = require('assert');
 
 const ME = 'UME';
-const nowSec = Math.floor(Date.now() / 1000);
+// 土日の扱いで結果が変わらないよう、時刻を水曜 12:00 (JST) に固定する
+const FIXED = Date.parse('2026-11-11T03:00:00Z');
+const nowSec = Math.floor(FIXED / 1000);
 const ts = (hoursAgo, n) => `${nowSec - hoursAgo * 3600}.00000${n}`;
 const T = { ask: ts(5, 1), promiseRoot: ts(6, 2), promise: ts(4, 3), doneRoot: ts(8, 4), done: ts(7, 5), dm: ts(1, 6), waitRoot: ts(31, 7), wait: ts(30, 8), freshRoot: ts(2, 9), fresh: ts(1, 1), group: ts(2, 2), more: ts(0.5, 3) };
 
@@ -37,6 +39,7 @@ let grid = [];
 const posted = [];
 const calls = { claude: 0, replies: 0 };
 let judgeFails = false;
+const extraMentions = [];
 
 const response = (code, body, headers) => ({
   getResponseCode: () => code, getContentText: () => JSON.stringify(body), getHeaders: () => headers || {},
@@ -61,8 +64,9 @@ function claude(req) {
   if (text.includes('確認します')) state = 'PROMISED';
   if (text.includes('こちらです')) state = 'DONE';
   if (text.includes('ログを送って') || text.includes('レビューをお願い')) state = 'WAITING_OTHERS';
+  if (text.includes('再依頼')) state = 'UNREPLIED';
   // 「確認します」の件だけ 10 時間後の期限つき
-  const due = new Date(Date.now() + 10 * 36e5 + 9 * 36e5).toISOString().slice(0, 16).replace('T', ' ');
+  const due = new Date(FIXED + 10 * 36e5 + 9 * 36e5).toISOString().slice(0, 16).replace('T', ' ');
   const next = state === 'WAITING_OTHERS' ? '' : state === 'DONE' ? '' : '返信する';
   return claudeJson({ state, summary: `要約(${state})`, reason: '根拠', next_action: next, due_at: state === 'PROMISED' ? due : '' });
 }
@@ -84,7 +88,7 @@ function slack(url, req) {
         { channel: { id: 'C1' }, ts: T.promiseRoot, permalink: link('C1', T.promiseRoot) },
         { channel: { id: 'C2' }, ts: T.doneRoot, permalink: link('C2', T.doneRoot) },
         { channel: { id: 'CNOTIFY' }, ts: ts(1, 9), permalink: link('CNOTIFY', ts(1, 9)) },
-      ];
+      ].concat(extraMentions);
     } else if (q.query.startsWith('<!subteam^SG1>')) {
       matches = [{ channel: { id: 'C4' }, ts: T.group, permalink: link('C4', T.group) }];
     } else if (q.query.startsWith('<!subteam')) {
@@ -151,7 +155,11 @@ const sandbox = {
   ScriptApp: {},
 };
 vm.createContext(sandbox);
-vm.runInContext(fs.readFileSync(require('path').join(__dirname, '../src/Code.gs'), 'utf8') + '\nthis.__api = { scanAndJudge, notify_, COLS, STATE, CFG, isRipe_, isMine_ };', sandbox);
+vm.runInContext(`const RealDate = Date; Date = class extends RealDate {
+  constructor(...a) { if (a.length) super(...a); else super(${FIXED}); }
+  static now() { return ${FIXED}; }
+};`, sandbox);
+vm.runInContext(fs.readFileSync(require('path').join(__dirname, '../src/Code.gs'), 'utf8') + '\nthis.__api = { scanAndJudge, notify_, COLS, STATE, CFG, isRipe_, isMine_, elapsedHours_, priority_ };', sandbox);
 const api = sandbox.__api;
 const { scanAndJudge, notify_, COLS, STATE, CFG } = api;
 CFG.NOTIFY_CHANNEL_ID = 'CNOTIFY';
@@ -215,10 +223,35 @@ assert.strictEqual(calls.claude, 0);
 assert.strictEqual(t[`C1:${T.ask}`].state, STATE.DONE);
 assert.strictEqual(t[`C1:${T.ask}`].pending_since, '');
 assert.strictEqual(t[`C1:${T.ask}`].summary, '要約(UNREPLIED)');
-// 朝のまとめ: 自分の対応待ち 2 件（期限つき + グループメンション） + 催促時期の相手待ち 1 件。待ち始めたばかりの相手待ちは載せない。
+// 6) 相手待ちの件で催促すると、そこから数え直して通知済みも解除される。
+assert.ok(table()[`C3:${T.waitRoot}`].last_notified_at);
+threads[`C3:${T.waitRoot}`].push({ user: ME, text: 'ログを送ってもらえますか（再送）', ts: T.more });
+scanAndJudge();
+t = table();
+assert.strictEqual(t[`C3:${T.waitRoot}`].state, STATE.WAITING_OTHERS);
+assert.strictEqual(t[`C3:${T.waitRoot}`].last_notified_at, '');
+assert.strictEqual(t[`C3:${T.waitRoot}`].priority, '低');
+
+// 7) 完了済みスレッドに新しい依頼が来て判定に失敗しても、次回の実行で再判定される。
+threads[`C2:${T.doneRoot}`].push({ user: 'UC', text: '再依頼: 別の URL もください', ts: T.more });
+const reask = { channel: { id: 'C2' }, ts: T.more, permalink: `https://x.slack.com/archives/C2/p1?thread_ts=${T.doneRoot}` };
+extraMentions.push(reask);
+judgeFails = true;
+scanAndJudge();
+assert.strictEqual(table()[`C2:${T.doneRoot}`].state, STATE.DONE);
+judgeFails = false;
+scanAndJudge();
+assert.strictEqual(table()[`C2:${T.doneRoot}`].state, STATE.UNREPLIED);
+
+// 8) 土日は経過時間に数えない（金 18:00 → 月 10:00 は 16 時間）。動きがないまま 14 日を過ぎたら打切り。
+assert.strictEqual(api.elapsedHours_(Date.parse('2026-11-06T09:00:00Z'), Date.parse('2026-11-09T01:00:00Z')), 16);
+const old = { state: STATE.WAITING_OTHERS, pending_since: new Date(FIXED - 15 * 864e5), due_at: '' };
+assert.strictEqual(api.priority_(old, FIXED), '打切り');
+
+// 朝のまとめ: 自分の対応待ち 3 件。催促し直した相手待ちは載らない。
 notify_('digest', (row, nowMs) => api.isMine_(row) || api.isRipe_(row, nowMs));
 assert.strictEqual(posted.length, 2);
-assert.strictEqual(posted[1].text.split('\n').length, 5);
+assert.strictEqual(posted[1].text.split('\n').length, 4);
 
 console.log('OK');
 console.log(posted.map((p) => p.text).join('\n---\n'));

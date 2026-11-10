@@ -26,7 +26,7 @@ Slack の未返信・対応未完了を AI が仕分けてスプレッドシー�
 | 中 | 期限まで 72 時間以内 / 通知時間（3 時間・24 時間）を超えた |
 | 低 | それ以外 |
 
-期限まで 24 時間を切った件は、放置時間に達していなくても通知する。個別の通知は 1 件につき 1 回で、以降は毎朝のまとめに載る。時間はすべて `src/Code.gs` の `CFG` で変えられる。
+経過時間は土日を除いて数える。期限まで 24 時間を切った件は、放置時間に達していなくても通知する。個別の通知は 1 件につき 1 回で、以降は毎朝のまとめに載る。相手待ちの件は、催促するなど新しい発言があるとそこから数え直す。動きがないまま 14 日を過ぎた件は追跡と通知をやめる（優先度が「打切り」になる）。1 通に載せるのは優先度順に 15 件まで。時間や件数はすべて `src/Code.gs` の `CFG` で変えられる。
 
 ## 何をどこで管理するか
 
@@ -56,7 +56,8 @@ Slack の App Configuration Token（12 時間で失効）を使う。使う時�
 
 1. https://api.slack.com/apps の「Your App Configuration Tokens」で Generate Token
 2. `setup-keychain slack-reply-watch`（username = App ID、password = 発行した Access Token）
-3. `make slack-validate` → `make slack-push`
+3. アプリを作った直後に一度 `make slack-pull`（Slack が補った項目を取り込む。`slack-push` は設定全体を置き換えるため）
+4. 以降は `slack/manifest.json` を直して `make slack-validate` → `make slack-push`
 
 スコープを変えた時は Slack 側でアプリの再インストールが要る。
 
