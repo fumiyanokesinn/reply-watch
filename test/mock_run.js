@@ -40,7 +40,7 @@ const dmHistory = [{ bot_id: 'B1', username: 'github', text: 'PR merged', ts: T.
 const props = { SLACK_USER_TOKEN: 'xoxp-test', SLACK_BOT_TOKEN: 'xoxb-test', NOTIFY_CHANNEL_ID: 'CNOTIFY' };
 const grids = {}; // シート名 → 2 次元配列
 const posted = [];
-const calls = { replies: 0, external: [] };
+const calls = { replies: 0, external: [], queries: [] };
 const extraMentions = [];
 
 const response = (code, body) => ({
@@ -57,6 +57,7 @@ function slack(url, req) {
     return response(200, { ok: true, usergroups: [{ id: 'SG1', handle: 'server', users: [ME] }, { id: 'SG2', handle: 'other', users: ['UX'] }] });
   }
   if (method === 'search.messages') {
+    calls.queries.push(q.query);
     let matches = [];
     const link = (c, t, root) => `https://x.slack.com/archives/${c}/p${t.replace('.', '')}${root ? `?thread_ts=${root}` : ''}`;
     if (q.query.startsWith(`<@${ME}>`)) {
@@ -139,9 +140,10 @@ vm.runInContext(`const RealDate = Date; Date = class extends RealDate {
   static now() { return ${FIXED}; }
 };`, sandbox);
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/Code.gs'), 'utf8') +
-  '\nthis.__api = { scan, notify_, COLS, STATE, CFG, parseDue_, isDueForStale_, isRipe_, isMine_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
+  '\nthis.__api = { scan, notify_, COLS, STATE, CFG, parseDue_, isDueForStale_, isActive_, isRipe_, isMine_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
 const api = sandbox.__api;
 const { scan, notify_, COLS, STATE } = api;
+api.CFG.INCLUDE_DM = true; // DM を含めた流れを先に確かめ、最後に外した場合を確かめる
 const table = () => Object.fromEntries(grids.threads.slice(1).map((r) => [r[0], Object.fromEntries(COLS.map((c, i) => [c, r[i]]))]));
 
 // Mac 側の仕分けの代役: 判定待ちを読み、本文の決め打ちで judgments シートに追記する。
@@ -319,6 +321,55 @@ api.CFG.MAX_NOTICE_ITEMS = 15;
 assert.ok(posted[3].text.includes('他 2 件はシートを参照'));
 const after = counts();
 assert.strictEqual(Object.keys(after).filter((k) => after[k] !== before[k]).length, 1);
+
+// 11) DM を対象外にすると、DM を検索せず、既にある DM の件（スレッド含む・古い行も）は追跡・通知・取得しない。
+//     判定待ちだった DM の本文はシートから消え、Mac 側にも渡らない。
+const dmKey = 'D1:dm';
+const dmRow = grids.threads.find((r) => r[0] === dmKey);
+dmRow[COLS.indexOf('pending_fp')] = 'fpX';
+dmRow[COLS.indexOf('pending_input')] = '{"messages":[{"text":"DM の本文"}]}';
+dmRow[COLS.indexOf('checked_at')] = new Date(FIXED - 7 * 36e5); // 完了済みの読み直し対象になる時刻
+dmRow[COLS.indexOf('dm')] = '';
+// 古い行のグループ DM（G…、種別スレッド、dm 列なし）: 検索で DM と分かれば対象外になる
+grids.threads.push(COLS.map((c) => ({ key: 'G5:9.9', kind: 'thread', state: STATE.UNREPLIED, pending_since: new Date(FIXED - 5 * 36e5),
+  permalink: 'https://x.slack.com/archives/G5/p99', fingerprint: 'fpG', latest_ts: new Date(FIXED - 5 * 36e5) })[c] ?? ''));
+extraMentions.push({ channel: { id: 'G5', is_mpim: true }, ts: '9.95', permalink: 'https://x.slack.com/archives/G5/p995?thread_ts=9.9' });
+api.CFG.INCLUDE_DM = false;
+calls.queries = [];
+const fetched = [];
+const origFetch = sandbox.UrlFetchApp.fetch;
+sandbox.UrlFetchApp.fetch = (url, req) => {
+  const u = new URL(url);
+  if (/conversations\.(history|replies)/.test(u.pathname)) fetched.push(u.searchParams.get('channel'));
+  return origFetch(url, req);
+};
+scan();
+sandbox.UrlFetchApp.fetch = origFetch;
+assert.ok(calls.queries.length > 0 && calls.queries.every((q) => !q.startsWith('is:dm')));
+assert.ok(!fetched.includes('D1') && !fetched.includes('G5'), fetched.join(','));
+t = table();
+assert.strictEqual(t[dmKey].pending_input, '');
+assert.strictEqual(t[dmKey].priority, '対象外');
+assert.strictEqual(t['G5:9.9'].dm, true);
+assert.strictEqual(t['G5:9.9'].priority, '対象外');
+// 判別できていない古い行も、分かるまでは対象外。普通のスレッドと分かっている行は対象のまま
+assert.strictEqual(api.priority_({ key: 'C8:1.1', kind: 'thread', dm: '', state: STATE.UNREPLIED, pending_since: new Date(FIXED), due_at: '' }, FIXED), '対象外');
+assert.notStrictEqual(t[`C1:${T.promiseRoot}`].priority, '対象外');
+const recent = new Date(FIXED - 5 * 36e5);
+const dmRows = [
+  { key: 'D9:dm', kind: 'dm', dm: false },
+  { key: 'D9:1.2', kind: 'thread', dm: false },
+  { key: 'C7:1.2', kind: 'thread', dm: true },
+].map((r) => ({ ...r, state: STATE.UNREPLIED, pending_since: recent, due_at: '' }));
+dmRows.forEach((r) => {
+  assert.strictEqual(api.priority_(r, FIXED), '対象外');
+  assert.strictEqual(api.isDueForStale_(r, FIXED) && api.isActive_(r, FIXED), false);
+});
+const normal = { key: 'C7:1.2', kind: 'thread', dm: false, state: STATE.UNREPLIED, pending_since: recent, due_at: '' };
+assert.notStrictEqual(api.priority_(normal, FIXED), '対象外');
+assert.ok(api.isActive_(normal, FIXED));
+api.CFG.INCLUDE_DM = true;
+assert.ok(api.isActive_(dmRows[0], FIXED));
 
 console.log('OK');
 console.log(posted.map((p) => p.text).join('\n---\n'));

@@ -1,0 +1,3 @@
+[tools]
+# CI（.github/workflows/test.yml）と揃える。launchd から動く時もこの版を使う
+node = "22"

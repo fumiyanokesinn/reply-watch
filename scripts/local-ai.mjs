@@ -69,9 +69,12 @@ const NOTICE_SCHEMA = {
 
 // ───────── 外部コマンド（テストでは差し替える） ─────────
 
+// launchd から動く時は、scripts/launchd.sh が確かめた実行ファイルの絶対パスを環境変数で渡す
+const BIN = { claude: process.env.REPLY_WATCH_CLAUDE || 'claude', gog: process.env.REPLY_WATCH_GOG || 'gog' };
+
 // エラーには終了コードなど決まった情報だけを載せる。コマンドの出力には Slack の本文が含まれうるので、ログへ流さない。
 function exec(cmd, args, opts = {}) {
-  const res = spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
+  const res = spawnSync(BIN[cmd], args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts });
   if (res.error) throw new Error(`${cmd}: ${res.error.code || '起動失敗'}`);
   if (res.status !== 0) throw new Error(`${cmd}: exit ${res.status}`);
   return res.stdout;
@@ -211,7 +214,9 @@ function prune(name) {
 export function judge() {
   const started = Date.now();
   const judged = done('judgments');
-  const waiting = table(io.readSheet('threads')).filter((r) => r.pending_fp && r.pending_input);
+  // 対象外（DM を外している間の DM）は、判定待ちが残っていても AI に渡さない
+  const waiting = table(io.readSheet('threads'))
+    .filter((r) => r.pending_fp && r.pending_input && r.priority !== '対象外');
   const fresh = waiting.filter((r) => !judged.has(`${r.key}|${r.pending_fp}`));
   const pending = fresh.slice(0, CFG.MAX_PER_RUN);
   // 判定済みで GAS の取り込み待ちの件（waiting - fresh）は、次の scan で反映される
@@ -264,7 +269,9 @@ export function judge() {
 export function notice() {
   const started = Date.now();
   const written = done('notices');
-  const all = table(io.readSheet('threads')).filter((r) => OPEN_LABELS.includes(r.state) && r.fingerprint);
+  // 対象外（DM を外している間の DM）や打切りの件は通知されないので、一文も作らない
+  const all = table(io.readSheet('threads'))
+    .filter((r) => OPEN_LABELS.includes(r.state) && r.fingerprint && !['対象外', '打切り'].includes(r.priority));
   const fresh = all.filter((r) => !written.has(`${r.key}|${r.fingerprint}`));
   const open = fresh.slice(0, CFG.MAX_PER_RUN);
   log('INFO', 'notice.start', {

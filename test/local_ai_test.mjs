@@ -15,11 +15,13 @@ const usageOf = (n) => ({ model: 'm', in: 10 * n, out: 5 * n, cache_create: 100,
 
 const sheets = {
   threads: [
-    ['key', 'state', 'summary', 'reason', 'next_action', 'fingerprint', 'pending_fp', 'pending_input'],
+    ['key', 'state', 'summary', 'reason', 'next_action', 'fingerprint', 'pending_fp', 'pending_input', 'priority'],
     ['C1:1', '', '', '', '', '', 'fp1', JSON.stringify({ me: 'UME', groups: [], done_reactions: ['done'], kind: 'スレッド', messages: [{ at: 'x', speaker: '他者(UA)', text: '見てください' }] })],
     ['C1:2', '未返信', '設定の件', '根拠', '返信する', 'fp2', '', ''],
     ['C1:3', '対応完了', '済んだ件', '根拠', '', 'fp3', 'fp3b', '壊れた JSON'],
     ['C1:4', '相手待ち', 'ログ待ち', '根拠', '', 'fp4', 'fp4b', JSON.stringify({ me: 'UME', groups: [], done_reactions: [], kind: 'スレッド', messages: [] })],
+    ['D1:dm', '未返信', 'DM の件', '根拠', '返信する', 'fp6', '', '', '対象外'],
+    ['D2:dm', '', '', '', '', '', 'fp7', JSON.stringify({ messages: [{ text: 'DM の本文' }] }), '対象外'],
   ],
   judgments: [['key', 'fingerprint', 'state'], ['C1:4', 'fp4b', 'WAITING_OTHERS']],
   notices: [['key', 'fingerprint', 'line']],

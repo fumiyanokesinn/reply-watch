@@ -15,6 +15,7 @@
  */
 
 const CFG = {
+  INCLUDE_DM: false, // DM（グループ DM 含む）を対象にするか。false の間は拾わず、既にある DM の件も追跡・通知しない
   DONE_REACTIONS: ['done', 'white_check_mark'], // 本人が付けたら対応完了として扱うリアクション
   LOOKBACK_DAYS: 3, // 新規に拾う範囲
   REMIND_AFTER_HOURS: 3, // 自分の対応待ち: 個別リマインドまでの放置時間（優先度「中」になる時間でもある）
@@ -52,11 +53,12 @@ const MINE_STATES = ['UNREPLIED', 'PROMISED']; // 自分が動く番
 const OPEN_STATES = MINE_STATES.concat('WAITING_OTHERS'); // 追跡して通知する対象
 const PRIORITY_RANK = { 高: 0, 中: 1, 低: 2 };
 const GAVE_UP = '打切り';
+const EXCLUDED = '対象外';
 
 const COLS = [
   'key', 'kind', 'permalink', 'state', 'priority', 'summary', 'reason', 'next_action',
   'due_at', 'pending_since', 'latest_ts', 'fingerprint', 'judged_at', 'checked_at',
-  'last_notified_at', 'notify_count', 'mute', 'pending_fp', 'pending_input', 'renotify_count',
+  'last_notified_at', 'notify_count', 'mute', 'pending_fp', 'pending_input', 'renotify_count', 'dm',
 ];
 const JUDGMENT_COLS = ['key', 'fingerprint', 'state', 'summary', 'reason', 'next_action', 'due_at', 'judged_at'];
 const NOTICE_COLS = ['key', 'fingerprint', 'line', 'written_at'];
@@ -78,7 +80,13 @@ function scan() {
     stat.判定取り込み = applyJudgments_(store);
     const me = myUserId_();
     const groups = myGroups_(me);
-    const cands = collectCandidates_(me, groups);
+    const dmFlags = new Map();
+    const cands = collectCandidates_(me, groups, dmFlags);
+    // dm 列の無い古い行は、検索で見えた時に DM かどうかを記録する（DM を外していても判別のために見る）
+    dmFlags.forEach((isDm, key) => {
+      const row = store.get(key);
+      if (row && row.dm !== true && row.dm !== false) row.dm = isDm;
+    });
     const targets = pickTargets_(cands, store);
     stat.候補 = cands.size;
     stat.対象 = targets.length;
@@ -169,15 +177,15 @@ function myGroups_(me) {
 }
 
 /** search.messages で「自分宛・所属グループ宛メンション / DM / 自分の発言」を含むスレッドを集める。 */
-function collectCandidates_(me, groups) {
+function collectCandidates_(me, groups, dmFlags) {
   const after = Utilities.formatDate(
     new Date(Date.now() - (CFG.LOOKBACK_DAYS + 1) * 864e5), CFG.TZ, 'yyyy-MM-dd');
   // ログには ID を含む検索語ではなく、経路の名前だけを出す
   const queries = [
     { label: '自分宛メンション', q: `<@${me}> after:${after}` },
-    { label: 'DM', q: `is:dm after:${after}` },
+  ].concat(CFG.INCLUDE_DM ? [{ label: 'DM', q: `is:dm after:${after}` }] : []).concat([
     { label: '自分の発言', q: `from:<@${me}> after:${after}` },
-  ].concat(groups.map((g, i) => ({ label: `グループ宛${i + 1}`, q: `<!subteam^${g.id}> after:${after}` })));
+  ]).concat(groups.map((g, i) => ({ label: `グループ宛${i + 1}`, q: `<!subteam^${g.id}> after:${after}` })));
   const ignored = ignoredChannels_();
   const cands = new Map();
   for (const { label, q: query } of queries) {
@@ -192,12 +200,14 @@ function collectCandidates_(me, groups) {
         const ch = m.channel || {};
         if (!ch.id || ignored.has(ch.id)) continue;
         const threadTs = (/[?&]thread_ts=([\d.]+)/.exec(m.permalink || '') || [])[1];
-        const isDm = ch.is_im || ch.is_mpim || ch.id.charAt(0) === 'D';
+        const isDm = Boolean(ch.is_im || ch.is_mpim || ch.id.charAt(0) === 'D');
         const key = isDm && !threadTs ? `${ch.id}:dm` : `${ch.id}:${threadTs || m.ts}`;
+        if (dmFlags) dmFlags.set(key, isDm);
+        if (isDm && !CFG.INCLUDE_DM) continue;
         const matchMs = tsToMs_(m.ts);
         const prev = cands.get(key);
         if (!prev || matchMs > prev.matchMs) {
-          cands.set(key, { key: key, kind: isDm && !threadTs ? 'dm' : 'thread', permalink: m.permalink, matchMs: matchMs });
+          cands.set(key, { key: key, kind: isDm && !threadTs ? 'dm' : 'thread', dm: isDm, permalink: m.permalink, matchMs: matchMs });
         }
       }
       const paging = (res.messages && res.messages.paging) || {};
@@ -217,7 +227,8 @@ function pickTargets_(cands, store) {
       row = newRow_(c);
       store.set(c.key, row);
     }
-    if (isMuted_(row)) continue;
+    row.dm = c.dm;
+    if (isMuted_(row) || isExcludedDm_(row)) continue;
     if ((!row.fingerprint && !row.pending_fp) || c.matchMs > toMs_(row.latest_ts)) {
       row.permalink = c.permalink;
       fresh.push(row);
@@ -228,7 +239,7 @@ function pickTargets_(cands, store) {
   const closed = [];
   const now = Date.now();
   for (const row of store.values()) {
-    if (picked.has(row) || isMuted_(row)) continue;
+    if (picked.has(row) || isMuted_(row) || isExcludedDm_(row)) continue;
     if (isActive_(row, now)) {
       open.push(row);
     } else if (!isOpen_(row) && now - toMs_(row.latest_ts) < CFG.LOOKBACK_DAYS * 864e5 &&
@@ -363,6 +374,7 @@ function parseDue_(text) {
 
 /** 期限までの残り時間と、止まってからの経過時間で優先度を決める。 */
 function priority_(row, nowMs) {
+  if (isExcludedDm_(row)) return EXCLUDED;
   if (!isOpen_(row)) return '';
   if (!isActive_(row, nowMs)) return GAVE_UP;
   const kind = isMine_(row) ? 'mine' : 'waiting';
@@ -375,7 +387,19 @@ function priority_(row, nowMs) {
 
 /** 追跡・通知の対象か。動きがないまま GIVE_UP_DAYS を過ぎた件は外す。 */
 function isActive_(row, nowMs) {
-  return isOpen_(row) && nowMs - toMs_(row.pending_since) < CFG.GIVE_UP_DAYS * 864e5;
+  return isOpen_(row) && !isExcludedDm_(row) && nowMs - toMs_(row.pending_since) < CFG.GIVE_UP_DAYS * 864e5;
+}
+
+/**
+ * DM を対象外にしている間の DM の件。
+ * dm 列が空の古い行は、チャンネル ID（D…）と種別で分かる分を除き DM かどうか分からない。
+ * グループ DM の可能性があるので、検索で見えて判別できるまでは対象外として扱う。
+ */
+function isExcludedDm_(row) {
+  if (CFG.INCLUDE_DM) return false;
+  if (row.kind === 'dm' || /^D/.test(String(row.key))) return true;
+  const dm = String(row.dm).toUpperCase();
+  return dm !== 'FALSE';
 }
 
 /** 土日（日本時間）を除いた経過時間。金曜夕方の件が月曜朝に「高」へ跳ね上がらないようにする。 */
@@ -581,6 +605,13 @@ function loadStore_() {
 
 function saveStore_(store) {
   const nowMs = Date.now();
+  // 対象外の DM の判定待ちは消す（Slack の本文をシートに残さず、Mac 側の AI にも渡さない）
+  store.forEach((r) => {
+    if (isExcludedDm_(r)) {
+      r.pending_fp = '';
+      r.pending_input = '';
+    }
+  });
   const cutoff = nowMs - CFG.PRUNE_CLOSED_DAYS * 864e5;
   const kept = Array.from(store.values())
     .filter((r) => isActive_(r, nowMs) || isMuted_(r) || !r.latest_ts || toMs_(r.latest_ts) > cutoff);
@@ -618,6 +649,7 @@ function newRow_(c) {
   row.permalink = c.permalink;
   row.notify_count = 0;
   row.renotify_count = 0;
+  row.dm = Boolean(c.dm);
   row.mute = false;
   return row;
 }
@@ -720,6 +752,8 @@ function installTriggers() {
     .filter((t) => handlers.indexOf(t.getHandlerFunction()) >= 0)
     .forEach((t) => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('scan').timeBased().everyMinutes(15).create();
+  // スプレッドシートを開いた時にも最新にする
+  ScriptApp.newTrigger('scan').forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet()).onOpen().create();
   ScriptApp.newTrigger('notifyStale').timeBased().everyMinutes(30).create();
   ScriptApp.newTrigger('morningDigest').timeBased().atHour(9).nearMinute(30).everyDays(1)
     .inTimezone(CFG.TZ).create();
