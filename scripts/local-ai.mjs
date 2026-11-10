@@ -40,8 +40,9 @@ const JUDGE_SCHEMA = {
           reason: { type: 'string' },
           next_action: { type: 'string' },
           due_at: { type: 'string' },
+          is_review_request_to_me: { type: 'boolean' },
         },
-        required: ['key', 'state', 'summary', 'reason', 'next_action', 'due_at'],
+        required: ['key', 'state', 'summary', 'reason', 'next_action', 'due_at', 'is_review_request_to_me'],
         additionalProperties: false,
       },
     },
@@ -157,6 +158,20 @@ function done(name) {
   return new Set(table(io.readSheet(name)).map((r) => `${r.key}|${r.fingerprint}`));
 }
 
+// judgments の 9 列目。本人が PR のレビューを頼まれている件か（GAS の PR_VALUES と同じ値。判定の版を兼ねる）
+const PR_TO_ME = 'REVIEW_TO_ME';
+const PR_OTHER = 'OTHER';
+
+/**
+ * 判定済みの「key|fingerprint」。9 列目が今の版の値でない判定（古い版）は数えず、判定し直す
+ * （見出しが付く前でも読めるよう、列の位置で見る）。
+ */
+function judgedSet() {
+  return new Set(io.readSheet('judgments').slice(1)
+    .filter((r) => r[0] && (r[8] === PR_TO_ME || r[8] === PR_OTHER))
+    .map((r) => `${r[0]}|${r[1]}`));
+}
+
 /** 件数と文字数の上限でまとめる。 */
 export function batches(items, maxItems, maxChars, size) {
   const out = [];
@@ -213,7 +228,7 @@ function prune(name) {
 
 export function judge() {
   const started = Date.now();
-  const judged = done('judgments');
+  const judged = judgedSet();
   // 対象外（DM を外している間の DM）は、判定待ちが残っていても AI に渡さない
   const waiting = table(io.readSheet('threads'))
     .filter((r) => r.pending_fp && r.pending_input && r.priority !== '対象外');
@@ -245,13 +260,13 @@ export function judge() {
       const out = callClaude('judge', CFG.JUDGE_MODEL, system, JUDGE_SCHEMA,
         `現在時刻: ${nowJst()} (JST)\n${JSON.stringify(threads)}`, threads.length);
       const rows = pick(out.items, fp).filter((it) => STATES.includes(it.state)).map((it) =>
-        [it.key, fp.get(it.key), it.state, it.summary, it.reason, it.next_action, it.due_at, nowJst()]);
+        [it.key, fp.get(it.key), it.state, it.summary, it.reason, it.next_action, it.due_at, nowJst(), it.is_review_request_to_me === true ? PR_TO_ME : PR_OTHER]);
       stage = 'sheet';
       if (rows.length) io.appendRows('judgments', rows);
       count += rows.length;
       log('INFO', 'judge.batch', {
         asked: threads.length, judged: rows.length, missing: threads.length - rows.length,
-        states: countBy(rows, 2), with_due: rows.filter((r) => r[6]).length,
+        states: countBy(rows, 2), with_due: rows.filter((r) => r[6]).length, review_to_me: rows.filter((r) => r[8] === PR_TO_ME).length,
       });
     } catch (e) {
       // 失敗した分は判定待ちのまま残り、次の起動でやり直す

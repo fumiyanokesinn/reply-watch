@@ -23,7 +23,9 @@ const sheets = {
     ['D1:dm', '未返信', 'DM の件', '根拠', '返信する', 'fp6', '', '', '対象外'],
     ['D2:dm', '', '', '', '', '', 'fp7', JSON.stringify({ messages: [{ text: 'DM の本文' }] }), '対象外'],
   ],
-  judgments: [['key', 'fingerprint', 'state'], ['C1:4', 'fp4b', 'WAITING_OTHERS']],
+  // C1:4 は判定済み。C1:1 には古い版の判定（9 列目なし、9 列目が真偽値）だけがあるので、判定し直す
+  judgments: [['key', 'fingerprint', 'state'], ['C1:4', 'fp4b', 'WAITING_OTHERS', '', '', '', '', '', 'OTHER'], ['C1:1', 'fp1', 'DONE'],
+    ['C1:1', 'fp1', 'DONE', '', '', '', '', '', true]],
   notices: [['key', 'fingerprint', 'line']],
 };
 const claudeCalls = [];
@@ -35,9 +37,9 @@ io.claude = (model, system, schema, input) => {
   if (system.includes('仕分ける')) {
     // 頼んでいない key、重複、未知の state を混ぜる
     return { usage: usageOf(1), data: { items: [
-      { key: 'C1:1', state: 'UNREPLIED', summary: '=HYPERLINK("x")', reason: 'r', next_action: 'n', due_at: '' },
-      { key: 'C1:1', state: 'DONE', summary: '重複', reason: 'r', next_action: '', due_at: '' },
-      { key: 'C9:9', state: 'DONE', summary: '頼んでいない', reason: 'r', next_action: '', due_at: '' },
+      { key: 'C1:1', state: 'UNREPLIED', summary: '=HYPERLINK("x")', reason: 'r', next_action: 'n', due_at: '', is_review_request_to_me: false },
+      { key: 'C1:1', state: 'DONE', summary: '重複', reason: 'r', next_action: '', due_at: '', is_review_request_to_me: false },
+      { key: 'C9:9', state: 'DONE', summary: '頼んでいない', reason: 'r', next_action: '', due_at: '', is_review_request_to_me: false },
     ] } };
   }
   return { usage: usageOf(2), data: { items: JSON.parse(input).map((i) => ({ key: i.key, line: `${i.summary}を進める` })) } };
@@ -50,7 +52,8 @@ assert.strictEqual(claudeCalls[0].model, CFG.JUDGE_MODEL);
 const sent = JSON.parse(claudeCalls[0].input.split('\n').slice(1).join('\n'));
 assert.deepStrictEqual(sent.map((s) => s.key), ['C1:1']);
 assert.deepStrictEqual(sheets.judgments.at(-1).slice(0, 4), ['C1:1', 'fp1', 'UNREPLIED', '=HYPERLINK("x")']);
-assert.strictEqual(sheets.judgments.length, 3);
+assert.strictEqual(sheets.judgments.at(-1)[8], 'OTHER');
+assert.strictEqual(sheets.judgments.length, 5);
 // 同じ内容は二度判定しない
 assert.strictEqual(judge(), 0);
 assert.strictEqual(claudeCalls.length, 1);
@@ -68,7 +71,7 @@ assert.strictEqual(notice(), 0);
 sheets.threads.push(['C1:5', '', '', '', '', '', 'fp5', JSON.stringify({ messages: [] })]);
 io.claude = () => { throw new Error('timeout'); };
 assert.strictEqual(judge(), 0);
-assert.strictEqual(sheets.judgments.length, 3);
+assert.strictEqual(sheets.judgments.length, 5);
 
 // ログ: 1 行 1 イベントで、件数・トークン数は残し、Slack 由来の文字列（要約や本文）は残さない。
 const lines = readFileSync(logFile(), 'utf8').trim().split('\n');

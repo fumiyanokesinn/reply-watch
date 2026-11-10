@@ -101,7 +101,8 @@ function slack(url, req) {
 const makeSheet = (name) => {
   const grid = (grids[name] = []);
   return {
-    getRange: (r) => ({
+    getRange: (r, c = 1, nr = 1, nc = 1) => ({
+      getValues: () => Array.from({ length: nr }, (_, i) => (grid[r - 1 + i] || []).slice(c - 1, c - 1 + nc)),
       setValues: (v) => { v.forEach((row, i) => { grid[r - 1 + i] = row.slice(); }); },
       clearContent: () => { grid.length = r - 1; },
       setNumberFormat: () => {},
@@ -109,6 +110,7 @@ const makeSheet = (name) => {
     setFrozenRows: () => {}, getMaxRows: () => 1000,
     getDataRange: () => ({ getValues: () => grid.map((row) => row.slice()) }),
     getLastRow: () => grid.length,
+    getLastColumn: () => Math.max(0, ...grid.map((row) => row.length)),
   };
 };
 const sheets = {};
@@ -162,7 +164,8 @@ function localJudge() {
     // 「確認します」の件だけ 10 時間後の期限つき
     const due = new Date(FIXED + 19 * 36e5).toISOString().slice(0, 16).replace('T', ' ');
     const next = state === 'UNREPLIED' || state === 'PROMISED' ? '返信する' : '';
-    grids.judgments.push([r.key, r.pending_fp, state, `要約(${state})`, '根拠', next, state === 'PROMISED' ? due : '', '']);
+    const pr = text.includes('PR #77') ? 'REVIEW_TO_ME' : 'OTHER';
+    grids.judgments.push([r.key, r.pending_fp, state, `要約(${state})`, '根拠', next, state === 'PROMISED' ? due : '', '', pr]);
     n++;
   });
   return n;
@@ -265,8 +268,8 @@ assert.strictEqual(table()[`C3:${T.waitRoot}`].state, STATE.WAITING_OTHERS);
 threads[`C2:${T.doneRoot}`].push({ user: 'UC', text: '再依頼: 別の URL もください', ts: T.more });
 extraMentions.push({ channel: { id: 'C2' }, ts: T.more, permalink: `https://x.slack.com/archives/C2/p1?thread_ts=${T.doneRoot}` });
 scan();
-grids.judgments.push([`C2:${T.doneRoot}`, '古い内容の指紋', 'NO_ACTION', 'x', 'x', '', '', '']);
-grids.judgments.push([`C2:${T.doneRoot}`, table()[`C2:${T.doneRoot}`].pending_fp, 'BOGUS', 'x', 'x', '', '', '']);
+grids.judgments.push([`C2:${T.doneRoot}`, '古い内容の指紋', 'NO_ACTION', 'x', 'x', '', '', '', 'OTHER']);
+grids.judgments.push([`C2:${T.doneRoot}`, table()[`C2:${T.doneRoot}`].pending_fp, 'BOGUS', 'x', 'x', '', '', '', 'OTHER']);
 scan();
 assert.strictEqual(table()[`C2:${T.doneRoot}`].state, STATE.DONE);
 assert.ok(table()[`C2:${T.doneRoot}`].pending_fp);
@@ -322,6 +325,86 @@ assert.ok(posted[3].text.includes('他 2 件はシートを参照'));
 const after = counts();
 assert.strictEqual(Object.keys(after).filter((k) => after[k] !== before[k]).length, 1);
 
+// 12) PR のレビュー依頼系は対象外。判定で分かったら優先度が「対象外」になり、取得・通知しない。
+//     PR かどうかを判定していない古い版の未完了の件は、内容が同じでも判定し直す。
+const prKey = `C1:${T.promiseRoot}`;
+const prRow = grids.threads.find((r) => r[0] === prKey);
+prRow[COLS.indexOf('pr_review')] = '';
+grids.judgments.forEach((r) => { if (r[0] === prKey) r.length = 8; }); // この件の判定は古い版だけにする
+scan();
+assert.ok(table()[prKey].pending_fp, '古い版の判定は判定し直しに回る');
+// 古い版の判定（9 列目なし・真偽値）は取り込まない
+grids.judgments.push([prKey, table()[prKey].pending_fp, 'DONE', 'x', 'x', '', '', '']);
+grids.judgments.push([prKey, table()[prKey].pending_fp, 'DONE', 'x', 'x', '', '', '', true]);
+scan();
+assert.ok(table()[prKey].pending_fp);
+threads[prKey][0].text += ' PR #77 のレビューお願いします';
+grids.judgments.push([prKey, table()[prKey].pending_fp, 'PROMISED', 'PR のレビュー', 'r', '見る', '', '', 'REVIEW_TO_ME']);
+scan();
+t = table();
+assert.strictEqual(t[prKey].pending_fp, '');
+assert.strictEqual(t[prKey].priority, '対象外');
+calls.replies = 0;
+notify_('digest', () => true);
+assert.ok(!posted.at(-1).text.includes('PR のレビュー'));
+
+// 13) EXCLUDE_BOT_IDS の bot が始めたスレッドは、AI に回さず対応不要にする（bot ID でも bot のユーザー ID でも）
+//     設定を後から足した場合も、判定済みの未完了の件や判定待ちに効く。人のユーザー ID や本人の ID は除外しない
+const botLate = `C1:${T.ask}`;
+threads[botLate][0] = { ...threads[botLate][0], bot_id: 'B7' };
+const lateRow = grids.threads.find((r) => r[0] === botLate);
+lateRow[COLS.indexOf('state')] = STATE.UNREPLIED;
+lateRow[COLS.indexOf('pending_since')] = new Date(FIXED - 2 * 36e5);
+lateRow[COLS.indexOf('pending_fp')] = 'fpZ';
+lateRow[COLS.indexOf('pending_input')] = '{"messages":[]}';
+props.EXCLUDE_BOT_IDS = 'B9, U9BOT, B7, UA, UME';
+const botKeyA = `C9:${ts(1, 4)}`;
+const botKeyB = `C9:${ts(1, 5)}`;
+threads[botKeyA] = [{ bot_id: 'B9', text: `Pending review ... Waiting on <@${ME}>`, ts: ts(1, 4) }, { user: 'UA', text: '見てください', ts: ts(0.5, 6) }];
+threads[botKeyB] = [{ user: 'U9BOT', bot_id: 'B8', text: `<@${ME}> reminder`, ts: ts(1, 5) }];
+extraMentions.push(
+  { channel: { id: 'C9' }, ts: ts(1, 4), permalink: `https://x.slack.com/archives/C9/p1` },
+  { channel: { id: 'C9' }, ts: ts(1, 5), permalink: `https://x.slack.com/archives/C9/p2` },
+);
+scan();
+t = table();
+[botKeyA, botKeyB, botLate].forEach((k) => {
+  assert.strictEqual(t[k].state, STATE.NO_ACTION, k);
+  assert.strictEqual(t[k].pending_fp, '', k);
+  assert.strictEqual(t[k].pending_input, '', k);
+});
+// UA（人）が始めた C4 のグループ宛てスレッドは、UA を書いても除外されない
+assert.notStrictEqual(t[`C4:${T.group}`].state, STATE.NO_ACTION);
+delete props.EXCLUDE_BOT_IDS;
+
+// 14) 判定待ちのまま PENDING_TTL_HOURS を過ぎた本文は消える
+const ttlRow = grids.threads.find((r) => r[0] === `C3:${T.freshRoot}`);
+ttlRow[COLS.indexOf('pending_fp')] = 'fpT';
+ttlRow[COLS.indexOf('pending_input')] = '{"messages":[{"text":"本文"}]}';
+ttlRow[COLS.indexOf('pending_at')] = new Date(FIXED - 73 * 36e5);
+notify_('stale', () => false);
+assert.strictEqual(table()[`C3:${T.freshRoot}`].pending_input, '');
+
+// pending_at の無い古い判定待ちは、読み込んだ時点の checked_at で起点が固定される。
+// 取得で checked_at が新しくなっても延びず、72 時間を過ぎると消える
+const oldPending = grids.threads.find((r) => r[0] === `C3:${T.freshRoot}`);
+oldPending[COLS.indexOf('pending_fp')] = table()[`C3:${T.freshRoot}`].fingerprint; // 内容は変わっていない
+for (let i = grids.judgments.length - 1; i > 0; i--) if (grids.judgments[i][0] === `C3:${T.freshRoot}`) grids.judgments.splice(i, 1); // まだ判定されていない状態にする
+oldPending[COLS.indexOf('pending_input')] = '{"messages":[{"text":"本文"}]}';
+oldPending[COLS.indexOf('pending_at')] = '';
+oldPending[COLS.indexOf('checked_at')] = new Date(FIXED - 71 * 36e5);
+scan();
+assert.ok(table()[`C3:${T.freshRoot}`].pending_input, '71 時間ではまだ消えない');
+assert.strictEqual(new Date(table()[`C3:${T.freshRoot}`].pending_at).getTime(), FIXED - 71 * 36e5);
+scan();
+assert.strictEqual(new Date(table()[`C3:${T.freshRoot}`].pending_at).getTime(), FIXED - 71 * 36e5, '起点は延びない');
+const oldPending2 = grids.threads.find((r) => r[0] === `C3:${T.freshRoot}`); // 保存で行が作り直されるので取り直す
+oldPending2[COLS.indexOf('pending_at')] = '';
+oldPending2[COLS.indexOf('checked_at')] = new Date(FIXED - 73 * 36e5);
+scan();
+assert.strictEqual(table()[`C3:${T.freshRoot}`].pending_input, '');
+assert.strictEqual(table()[`C3:${T.freshRoot}`].pending_fp, '');
+
 // 11) DM を対象外にすると、DM を検索せず、既にある DM の件（スレッド含む・古い行も）は追跡・通知・取得しない。
 //     判定待ちだった DM の本文はシートから消え、Mac 側にも渡らない。
 const dmKey = 'D1:dm';
@@ -354,7 +437,7 @@ assert.strictEqual(t['G5:9.9'].dm, true);
 assert.strictEqual(t['G5:9.9'].priority, '対象外');
 // 判別できていない古い行も、分かるまでは対象外。普通のスレッドと分かっている行は対象のまま
 assert.strictEqual(api.priority_({ key: 'C8:1.1', kind: 'thread', dm: '', state: STATE.UNREPLIED, pending_since: new Date(FIXED), due_at: '' }, FIXED), '対象外');
-assert.notStrictEqual(t[`C1:${T.promiseRoot}`].priority, '対象外');
+assert.notStrictEqual(t[`C4:${T.group}`].priority, '対象外');
 const recent = new Date(FIXED - 5 * 36e5);
 const dmRows = [
   { key: 'D9:dm', kind: 'dm', dm: false },

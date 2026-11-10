@@ -46,7 +46,9 @@ const CASES = [
     m('11/10 10:00', '他者(UA)', `<@${ME}> バッチが失敗しました`),
     m('11/10 10:10', '本人', '原因を調べるので、失敗した時刻とジョブ名を教えてください'),
   ])],
+  // 本人が頼んだ側なので、本人へのレビュー依頼には入らない（相手待ちとして通知する）
   ['相手待ち（自分から依頼）', 'WAITING_OTHERS', env([m('11/10 10:00', '本人', '<@UB> PR #123 のレビューをお願いします')])],
+  ['相手待ち（自分から依頼・PR 以外）', 'WAITING_OTHERS', env([m('11/10 10:00', '本人', '<@UB> 来月のシフト希望を金曜までに送ってもらえますか')])],
   ['共有のみ', 'NO_ACTION', env([m('11/10 10:00', '他者(UA)', `<@${ME}> 参考までに、昨日の障害報告書です。対応は不要です`)])],
   ['グループ宛・他の人が対応済み', 'NO_ACTION', env([
     m('11/10 10:00', '他者(UA)', '<!subteam^SG1|@server> デプロイの承認をお願いします'),
@@ -58,6 +60,19 @@ const CASES = [
     m('11/10 10:00', '他者(UA)', `<@${ME}> 請求データの修正をお願いします\n[11/10 10:05] 本人: 対応完了しました`),
   ])],
   ['期限つき', 'UNREPLIED', env([m('11/10 10:00', '他者(UA)', `<@${ME}> 見積もりを 11/14 の 15 時までにください`)])],
+  ['PR レビュー依頼（頼まれた側）', 'UNREPLIED', env([
+    m('11/10 10:00', '他者(UA)', `<@${ME}> palmu-api-go #3185 のレビューお願いします！ https://github.com/example/repo/pull/3185`),
+  ]), true],
+  ['PR レビュー（確認しますのまま）', 'PROMISED', env([
+    m('11/10 10:00', '他者(UA)', `<@${ME}> 先週お願いした PR #808、レビューどうでしょう？`),
+    m('11/10 10:10', '本人', '見ておきます'),
+  ]), true],
+  // 本人が頼んだ側は対象のまま（相手待ちとして催促する）
+  ['PR レビュー催促（自分から）', 'WAITING_OTHERS', env([m('11/10 10:00', '本人', '<!subteam^SG1|@server> 削除 PR 3 件のレビューをお願いします。今週中に入れたいです')])],
+  ['PR レビュー依頼（本人を含むグループ宛）', 'UNREPLIED', env([m('11/10 10:00', '他者(UA)', '<!subteam^SG1|@server> release v3.13.0 の PR #796 レビューできる方いますか？')]), true],
+  ['PR が出てくるが主題は障害調査', 'UNREPLIED', env([
+    m('11/10 10:00', '他者(UA)', `<@${ME}> 昨日マージされた PR #900 以降、本番で 500 が増えています。原因を見てもらえますか`),
+  ]), false],
   ['DM の雑談', 'NO_ACTION', env([
     m('11/10 12:00', '他者(UA)', 'お昼どこ行きました？'),
     m('11/10 12:30', '本人', 'いつもの蕎麦屋です'),
@@ -65,21 +80,22 @@ const CASES = [
   ], 'DM の直近のやり取り')],
 ];
 
-const header = ['key', 'state', 'fingerprint', 'pending_fp', 'pending_input'];
+const header = ['key', 'state', 'fingerprint', 'pending_fp', 'pending_input', 'priority'];
 const written = [];
 io.readSheet = (name) => (name === 'threads'
-  ? [header, ...CASES.map(([name_, , input], i) => [`case${i}`, '', '', 'fp', input])]
+  ? [header, ...CASES.map(([name_, , input], i) => [`case${i}`, '', '', 'fp', input, ''])]
   : [['key', 'fingerprint']]);
 io.appendRows = (name, rows) => written.push(...rows);
 
 judge();
 const byKey = new Map(written.map((r) => [r[0], r]));
 let ok = 0;
-CASES.forEach(([name, expected], i) => {
+CASES.forEach(([name, expected, , prExpected = false], i) => {
   const r = byKey.get(`case${i}`);
-  const got = r ? r[2] : '(結果なし)';
-  if (got === expected) ok++;
-  console.log(`${got === expected ? 'OK ' : 'NG '} ${name}: ${got}${got === expected ? '' : `（期待 ${expected}）`}`);
+  const got = r ? `${r[2]}${r[8] === 'REVIEW_TO_ME' ? '+PR' : ''}` : '(結果なし)';
+  const want = `${expected}${prExpected ? '+PR' : ''}`;
+  if (got === want) ok++;
+  console.log(`${got === want ? 'OK ' : 'NG '} ${name}: ${got}${got === want ? '' : `（期待 ${want}）`}`);
   if (r) console.log(`     要約=${r[3]} / 根拠=${r[4]} / 次=${r[5]} / 期限=${r[6]}`);
 });
 console.log(`${ok}/${CASES.length}`);

@@ -12,12 +12,15 @@
  *   SLACK_BOT_TOKEN    xoxb-…  通知投稿用（chat:write）。本人名義で投稿すると通知が鳴らないため bot で投稿する
  *   NOTIFY_CHANNEL_ID  通知先チャンネル ID（bot を招待しておく）
  *   IGNORE_CHANNEL_IDS 任意。監視対象外にするチャンネル ID（カンマ区切り）
+ *   EXCLUDE_BOT_IDS    任意。この bot（bot ID の B… か、bot のユーザー ID の U…）が始めたスレッドは対象外（カンマ区切り）
  */
 
 const CFG = {
+  // 本人が PR のレビューを頼まれている件を対象外にする（別のアラートで扱う）。本人が頼んだ側の件は対象のまま
+  EXCLUDE_PR_REVIEW: true,
   INCLUDE_DM: false, // DM（グループ DM 含む）を対象にするか。false の間は拾わず、既にある DM の件も追跡・通知しない
   DONE_REACTIONS: ['done', 'white_check_mark'], // 本人が付けたら対応完了として扱うリアクション
-  LOOKBACK_DAYS: 3, // 新規に拾う範囲
+  LOOKBACK_DAYS: 14, // 新規に拾う範囲（追跡を打ち切る GIVE_UP_DAYS と揃える）
   REMIND_AFTER_HOURS: 3, // 自分の対応待ち: 個別リマインドまでの放置時間（優先度「中」になる時間でもある）
   RENOTIFY_AFTER_HOURS: 4, // 個別通知（または朝のまとめ）から対応がないまま、この時間が経ったらもう一度知らせる
   MAX_RENOTIFY: 1, // その再通知の回数（翌朝のまとめで数え直す）
@@ -33,6 +36,7 @@ const CFG = {
   PRUNE_CLOSED_DAYS: 30, // 完了・対応不要の行をシートから消すまでの日数
   MAX_THREAD_MESSAGES: 40,
   MAX_MESSAGE_CHARS: 800,
+  PENDING_TTL_HOURS: 72, // 判定待ちのまま Mac 側で判定されない本文は、この時間で消す（次の取得で積み直す）
   MAX_INPUT_CHARS: 40000, // 判定待ちとして 1 セルに積む JSON の上限（セルの上限は 5 万字）
   TIME_BUDGET_MS: 4.5 * 60 * 1000, // GAS の 6 分制限に対する打ち切り時間
   SLACK_INTERVAL_MS: 1200, // history 系 API の呼び出し間隔（Tier 3 = 50回/分）
@@ -54,13 +58,17 @@ const OPEN_STATES = MINE_STATES.concat('WAITING_OTHERS'); // 追跡して通知�
 const PRIORITY_RANK = { 高: 0, 中: 1, 低: 2 };
 const GAVE_UP = '打切り';
 const EXCLUDED = '対象外';
+// pr_review 列の値。本人が PR のレビューを頼まれている件か、それ以外か（判定の版を兼ねる）
+const PR_TO_ME = 'REVIEW_TO_ME';
+const PR_OTHER = 'OTHER';
+const PR_VALUES = [PR_TO_ME, PR_OTHER];
 
 const COLS = [
   'key', 'kind', 'permalink', 'state', 'priority', 'summary', 'reason', 'next_action',
   'due_at', 'pending_since', 'latest_ts', 'fingerprint', 'judged_at', 'checked_at',
-  'last_notified_at', 'notify_count', 'mute', 'pending_fp', 'pending_input', 'renotify_count', 'dm',
+  'last_notified_at', 'notify_count', 'mute', 'pending_fp', 'pending_input', 'renotify_count', 'dm', 'pr_review', 'pending_at',
 ];
-const JUDGMENT_COLS = ['key', 'fingerprint', 'state', 'summary', 'reason', 'next_action', 'due_at', 'judged_at'];
+const JUDGMENT_COLS = ['key', 'fingerprint', 'state', 'summary', 'reason', 'next_action', 'due_at', 'judged_at', 'pr_review'];
 const NOTICE_COLS = ['key', 'fingerprint', 'line', 'written_at'];
 
 // ───────────────────────── 収集（GAS） ─────────────────────────
@@ -73,7 +81,7 @@ function scan() {
   const store = loadStore_();
   const stat = {
     候補: 0, 対象: 0, 取得: 0, 変化なし: 0, 判定待ちに追加: 0, 規則で完了: 0, 規則で対応不要: 0,
-    判定取り込み: 0, 取得失敗: 0, 時間切れで次回: 0,
+    判定取り込み: 0, 取得失敗: 0, 時間切れで次回: 0, 除外botのスレッド: 0,
   };
   try {
     ensureSheet_(CFG.NOTICES_SHEET, NOTICE_COLS); // Mac 側が追記できるよう先に用意しておく
@@ -81,7 +89,7 @@ function scan() {
     const me = myUserId_();
     const groups = myGroups_(me);
     const dmFlags = new Map();
-    const cands = collectCandidates_(me, groups, dmFlags);
+    const cands = collectCandidates_(me, groups, dmFlags, timeUp);
     // dm 列の無い古い行は、検索で見えた時に DM かどうかを記録する（DM を外していても判別のために見る）
     dmFlags.forEach((isDm, key) => {
       const row = store.get(key);
@@ -106,7 +114,21 @@ function scan() {
       }
       row.checked_at = new Date();
       stat.取得++;
-      if (!unit || unit.fingerprint === row.fingerprint || unit.fingerprint === row.pending_fp) {
+      // 除外 bot のスレッドは、内容が変わっていなくても対応不要にして判定待ちも消す（設定を後から足した場合も効くように）
+      if (unit && unit.excludedBot) {
+        if (row.state !== STATE.NO_ACTION || row.fingerprint !== unit.fingerprint || row.pending_fp) {
+          stat.除外botのスレッド++;
+          row.latest_ts = unit.latestDate;
+          applyJudgment_(row, unit.fingerprint, {
+            state: 'NO_ACTION', summary: '除外する bot の投稿', reason: 'EXCLUDE_BOT_IDS の bot が始めたスレッド', next_action: '', due_at: '', pr_review: PR_OTHER,
+          });
+        } else {
+          stat.変化なし++;
+        }
+        continue;
+      }
+      const unchanged = unit && (unit.fingerprint === row.fingerprint || unit.fingerprint === row.pending_fp);
+      if (!unit || (unchanged && !needsRejudge_(row))) {
         stat.変化なし++;
         continue;
       }
@@ -120,16 +142,17 @@ function scan() {
       if (unit.doneByReaction) {
         stat.規則で完了++;
         applyJudgment_(row, unit.fingerprint, {
-          state: 'DONE', summary: row.summary || '（要約なし）', reason: '本人が完了のリアクションを付けた', next_action: '', due_at: '',
+          state: 'DONE', summary: row.summary || '（要約なし）', reason: '本人が完了のリアクションを付けた', next_action: '', due_at: '', pr_review: PR_OTHER,
         });
       } else if (!unit.needsAi) {
         stat.規則で対応不要++;
         applyJudgment_(row, unit.fingerprint, {
-          state: 'NO_ACTION', summary: 'bot 投稿のみ', reason: '人の発言がないため AI 判定を省略', next_action: '', due_at: '',
+          state: 'NO_ACTION', summary: 'bot 投稿のみ', reason: '人の発言がないため AI 判定を省略', next_action: '', due_at: '', pr_review: PR_OTHER,
         });
       } else {
         // 判定は Mac 側に任せる。結果が judgments シートに書かれるまで、状態は前回のまま
         stat.判定待ちに追加++;
+        if (row.pending_fp !== unit.fingerprint) row.pending_at = new Date();
         row.pending_fp = unit.fingerprint;
         row.pending_input = JSON.stringify({
           me: me, groups: groups, done_reactions: CFG.DONE_REACTIONS,
@@ -152,6 +175,8 @@ function scan() {
 function applyJudgments_(store) {
   let applied = 0;
   readRows_(CFG.JUDGMENTS_SHEET, JUDGMENT_COLS).forEach((j) => {
+    // pr_review の無い（または形式の違う）判定は古い版の結果。取り込むと判定し直しが終わらないので使わない
+    if (PR_VALUES.indexOf(j.pr_review) < 0) return;
     const row = store.get(j.key);
     if (!row || !row.pending_fp || row.pending_fp !== j.fingerprint) return;
     try {
@@ -177,7 +202,7 @@ function myGroups_(me) {
 }
 
 /** search.messages で「自分宛・所属グループ宛メンション / DM / 自分の発言」を含むスレッドを集める。 */
-function collectCandidates_(me, groups, dmFlags) {
+function collectCandidates_(me, groups, dmFlags, timeUp) {
   const after = Utilities.formatDate(
     new Date(Date.now() - (CFG.LOOKBACK_DAYS + 1) * 864e5), CFG.TZ, 'yyyy-MM-dd');
   // ログには ID を含む検索語ではなく、経路の名前だけを出す
@@ -191,6 +216,7 @@ function collectCandidates_(me, groups, dmFlags) {
   for (const { label, q: query } of queries) {
     let count = 0;
     for (let page = 1; page <= 5; page++) {
+      if (timeUp && timeUp()) break; // 残りは次回（取得の時間を残す）
       const res = slack_('search.messages', {
         query: query, count: 100, page: page, sort: 'timestamp', sort_dir: 'desc',
       });
@@ -228,7 +254,7 @@ function pickTargets_(cands, store) {
       store.set(c.key, row);
     }
     row.dm = c.dm;
-    if (isMuted_(row) || isExcludedDm_(row)) continue;
+    if (isMuted_(row) || isExcluded_(row)) continue;
     if ((!row.fingerprint && !row.pending_fp) || c.matchMs > toMs_(row.latest_ts)) {
       row.permalink = c.permalink;
       fresh.push(row);
@@ -239,7 +265,7 @@ function pickTargets_(cands, store) {
   const closed = [];
   const now = Date.now();
   for (const row of store.values()) {
-    if (picked.has(row) || isMuted_(row) || isExcludedDm_(row)) continue;
+    if (picked.has(row) || isMuted_(row) || isExcluded_(row)) continue;
     if (isActive_(row, now)) {
       open.push(row);
     } else if (!isOpen_(row) && now - toMs_(row.latest_ts) < CFG.LOOKBACK_DAYS * 864e5 &&
@@ -247,7 +273,9 @@ function pickTargets_(cands, store) {
       closed.push(row);
     }
   }
-  return fresh.concat(open, closed);
+  // 時間切れで毎回同じ件だけが後回しにならないよう、長く見ていない順に読む
+  const byChecked = (a, b) => toMs_(a.checked_at) - toMs_(b.checked_at);
+  return fresh.concat(open.sort(byChecked), closed.sort(byChecked));
 }
 
 /** スレッド（または DM の直近のやり取り）を取得し、判定用テキストと変化検知用の指紋を作る。 */
@@ -284,11 +312,16 @@ function fetchUnit_(row, me) {
   const isHuman = (m) => !m.bot_id && m.user;
   // 他の人の最後の発言、またはそれ以降に本人が完了リアクションを付けていれば、AI を通さず完了にする。
   // それより前の発言に付いている場合は、後から来た依頼が残っているかもしれないので AI に読ませる。
+  const excludedBots = excludedBots_();
+  const first = messages[0] || {};
+  // U… の指定は bot の投稿（bot_id のある発言）にだけ当てる。人の ID を誤って入れても、その人のスレッドは除外しない
+  const excludedBot = excludedBots.has(first.bot_id) || (Boolean(first.bot_id) && excludedBots.has(first.user));
   const lastOther = all.filter((m) => isHuman(m) && m.user !== me).pop();
   const doneByReaction = all.some((m) =>
     (!lastOther || tsToMs_(m.ts) >= tsToMs_(lastOther.ts)) &&
     (m.reactions || []).some((r) => CFG.DONE_REACTIONS.indexOf(r.name) >= 0 && (r.users || []).indexOf(me) >= 0));
   return {
+    excludedBot: excludedBot,
     doneByReaction: doneByReaction,
     fingerprint: `${all.length}|${latestTs}|${myReactions.join(',')}`,
     latestDate: new Date(tsToMs_(latestTs)),
@@ -346,6 +379,7 @@ function applyJudgment_(row, fingerprint, j) {
   row.fingerprint = fingerprint;
   row.pending_fp = '';
   row.pending_input = '';
+  row.pending_at = '';
   row.judged_at = new Date();
   if (!isOpen_(row)) {
     row.pending_since = '';
@@ -358,6 +392,7 @@ function applyJudgment_(row, fingerprint, j) {
     row.notify_count = 0;
   }
   row.due_at = parseDue_(j.due_at);
+  row.pr_review = j.pr_review;
   row.priority = priority_(row, Date.now());
 }
 
@@ -374,7 +409,7 @@ function parseDue_(text) {
 
 /** 期限までの残り時間と、止まってからの経過時間で優先度を決める。 */
 function priority_(row, nowMs) {
-  if (isExcludedDm_(row)) return EXCLUDED;
+  if (isExcluded_(row)) return EXCLUDED;
   if (!isOpen_(row)) return '';
   if (!isActive_(row, nowMs)) return GAVE_UP;
   const kind = isMine_(row) ? 'mine' : 'waiting';
@@ -387,7 +422,17 @@ function priority_(row, nowMs) {
 
 /** 追跡・通知の対象か。動きがないまま GIVE_UP_DAYS を過ぎた件は外す。 */
 function isActive_(row, nowMs) {
-  return isOpen_(row) && !isExcludedDm_(row) && nowMs - toMs_(row.pending_since) < CFG.GIVE_UP_DAYS * 864e5;
+  return isOpen_(row) && !isExcluded_(row) && nowMs - toMs_(row.pending_since) < CFG.GIVE_UP_DAYS * 864e5;
+}
+
+/** 対象外の件（DM を外している間の DM、PR のレビュー依頼系）。取得・追跡・通知しない。 */
+function isExcluded_(row) {
+  return isExcludedDm_(row) || (CFG.EXCLUDE_PR_REVIEW && row.pr_review === PR_TO_ME);
+}
+
+/** 対応が残っていて、まだ「本人への PR レビュー依頼か」を今の基準で判定していない件。 */
+function needsRejudge_(row) {
+  return isOpen_(row) && !isExcluded_(row) && PR_VALUES.indexOf(row.pr_review) < 0;
 }
 
 /**
@@ -552,7 +597,10 @@ function slack_(method, params, opt) {
     const res = UrlFetchApp.fetch(url, request);
     if (res.getResponseCode() === 429) {
       const headers = res.getHeaders();
-      Utilities.sleep((Number(headers['Retry-After'] || headers['retry-after'] || 30) + 1) * 1000);
+      // 待ち時間は 60 秒まで（GAS の実行時間を使い切らない。待ちきれなければ失敗として次回に回す）
+      const wait = Number(headers['Retry-After'] || headers['retry-after'] || 30) + 1;
+      if (wait > 60) throw new Error(`Slack ${method}: rate limited`);
+      Utilities.sleep(wait * 1000);
       continue;
     }
     const body = JSON.parse(res.getContentText());
@@ -578,6 +626,10 @@ function ensureSheet_(name, cols) {
     // ts を含む列が数値に化けないよう、全列を文字列扱いにしておく（日付は書き込み時に Date で入る）
     ['key', 'fingerprint', 'pending_fp'].filter((c) => cols.indexOf(c) >= 0).forEach((c) =>
       sheet.getRange(1, cols.indexOf(c) + 1, sheet.getMaxRows(), 1).setNumberFormat('@'));
+  } else {
+    // 列を足した時に見出しを追随させる（Mac 側が先に列を書いていても、見出しの中身で比べる）
+    const header = sheet.getRange(1, 1, 1, cols.length).getValues()[0];
+    if (cols.some((c, i) => header[i] !== c)) sheet.getRange(1, 1, 1, cols.length).setValues([cols]);
   }
   return sheet;
 }
@@ -598,6 +650,9 @@ function loadStore_() {
     if (!v[0]) return;
     const row = {};
     COLS.forEach((c, i) => { row[c] = v[i]; });
+    // pending_at を記録する前に積まれた判定待ちは、その時点の checked_at を起点に固定する
+    // （checked_at は取得のたびに新しくなるので、起点に使い続けると本文がいつまでも消えない）
+    if (row.pending_fp && !row.pending_at) row.pending_at = row.checked_at || new Date();
     store.set(row.key, row);
   });
   return store;
@@ -607,9 +662,12 @@ function saveStore_(store) {
   const nowMs = Date.now();
   // 対象外の DM の判定待ちは消す（Slack の本文をシートに残さず、Mac 側の AI にも渡さない）
   store.forEach((r) => {
-    if (isExcludedDm_(r)) {
+    // 対象外の DM と、長く判定されない判定待ちは本文を消す
+    const stale = r.pending_fp && nowMs - toMs_(r.pending_at) > CFG.PENDING_TTL_HOURS * 36e5;
+    if (isExcludedDm_(r) || stale) {
       r.pending_fp = '';
       r.pending_input = '';
+      r.pending_at = '';
     }
   });
   const cutoff = nowMs - CFG.PRUNE_CLOSED_DAYS * 864e5;
@@ -677,6 +735,14 @@ function ignoredChannels_() {
   const extra = PropertiesService.getScriptProperties().getProperty('IGNORE_CHANNEL_IDS') || '';
   const ids = extra.split(',').map((s) => s.trim()).filter(String);
   return new Set(ids.concat(notifyChannel_()));
+}
+
+/** 対象外にする bot の ID（B… / U…）。スクリプトプロパティ EXCLUDE_BOT_IDS（任意）。 */
+function excludedBots_() {
+  const v = PropertiesService.getScriptProperties().getProperty('EXCLUDE_BOT_IDS') || '';
+  const ids = new Set(v.split(',').map((s) => s.trim()).filter(String));
+  ids.delete(myUserId_()); // 本人の ID は除外の対象にしない
+  return ids;
 }
 
 function notifyChannel_() {
