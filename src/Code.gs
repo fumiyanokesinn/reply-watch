@@ -18,6 +18,8 @@ const CFG = {
   DONE_REACTIONS: ['done', 'white_check_mark'], // 本人が付けたら対応完了として扱うリアクション
   LOOKBACK_DAYS: 3, // 新規に拾う範囲
   REMIND_AFTER_HOURS: 3, // 自分の対応待ち: 個別リマインドまでの放置時間（優先度「中」になる時間でもある）
+  RENOTIFY_AFTER_HOURS: 4, // 個別通知（または朝のまとめ）から対応がないまま、この時間が経ったらもう一度知らせる
+  MAX_RENOTIFY: 1, // その再通知の回数（翌朝のまとめで数え直す）
   NUDGE_AFTER_HOURS: 24, // 相手待ち: 催促候補として通知するまでの時間（同上）
   HIGH_AFTER_HOURS: { mine: 24, waiting: 72 }, // 優先度「高」になる放置時間
   DUE_SOON_HOURS: 24, // 期限までこの時間を切ったら優先度「高」にして、放置時間に関わらず通知する
@@ -54,7 +56,7 @@ const GAVE_UP = '打切り';
 const COLS = [
   'key', 'kind', 'permalink', 'state', 'priority', 'summary', 'reason', 'next_action',
   'due_at', 'pending_since', 'latest_ts', 'fingerprint', 'judged_at', 'checked_at',
-  'last_notified_at', 'notify_count', 'mute', 'pending_fp', 'pending_input',
+  'last_notified_at', 'notify_count', 'mute', 'pending_fp', 'pending_input', 'renotify_count',
 ];
 const JUDGMENT_COLS = ['key', 'fingerprint', 'state', 'summary', 'reason', 'next_action', 'due_at', 'judged_at'];
 const NOTICE_COLS = ['key', 'fingerprint', 'line', 'written_at'];
@@ -88,6 +90,7 @@ function scan() {
       if (isOpen_(row) && !isMine_(row) && unit.latestDate.getTime() > toMs_(row.latest_ts)) {
         row.pending_since = unit.latestDate;
         row.last_notified_at = '';
+        row.renotify_count = 0;
       }
       row.latest_ts = unit.latestDate;
       if (unit.doneByReaction) {
@@ -309,6 +312,7 @@ function applyJudgment_(row, fingerprint, j) {
     // 相手待ちなら本人が最後に返した時刻から経過時間を数える
     row.pending_since = row.latest_ts;
     row.last_notified_at = '';
+    row.renotify_count = 0;
     row.notify_count = 0;
   }
   row.due_at = parseDue_(j.due_at);
@@ -374,7 +378,15 @@ function notifyStale() {
   const now = new Date();
   const hour = Number(Utilities.formatDate(now, CFG.TZ, 'H'));
   if (!isWeekday_(now) || hour < CFG.WORK_START_HOUR || hour >= CFG.WORK_END_HOUR) return;
-  notify_('stale', (row, nowMs) => !row.last_notified_at && isRipe_(row, nowMs));
+  notify_('stale', isDueForStale_);
+}
+
+/** 個別に知らせる件か。初回は通知時期に達した時点、その後は対応がないまま RENOTIFY_AFTER_HOURS 経った時点。 */
+function isDueForStale_(row, nowMs) {
+  if (!isRipe_(row, nowMs)) return false;
+  if (!row.last_notified_at) return true;
+  return Number(row.renotify_count || 0) < CFG.MAX_RENOTIFY &&
+    nowMs - toMs_(row.last_notified_at) >= CFG.RENOTIFY_AFTER_HOURS * 36e5;
 }
 
 /** 毎朝、自分の対応待ち全件と、催促時期に達した相手待ちをまとめて 1 通投稿する。 */
@@ -402,7 +414,10 @@ function notify_(mode, filter) {
     rows.forEach((r) => {
       r.notify_count = Number(r.notify_count || 0) + 1;
       // 朝のまとめに載っただけの新しい件は、通知時期に達した時点で個別にも知らせる
-      if (isRipe_(r, nowMs)) r.last_notified_at = new Date(nowMs);
+      if (!isRipe_(r, nowMs)) return;
+      // 個別通知の後の再通知を数える。朝のまとめに載ったら、その日の再通知は数え直す
+      r.renotify_count = mode === 'stale' && r.last_notified_at ? Number(r.renotify_count || 0) + 1 : 0;
+      r.last_notified_at = new Date(nowMs);
     });
   } finally {
     saveStore_(store);
@@ -530,6 +545,7 @@ function saveStore_(store) {
   const muteCol = COLS.indexOf('mute');
   const current = new Map(sheet.getDataRange().getValues().slice(1).map((v) => [v[0], v[muteCol]]));
   rows.forEach((r) => { if (current.has(r.key)) r.mute = current.get(r.key); });
+  sheet.getRange(1, 1, 1, COLS.length).setValues([COLS]); // 列を足した時に見出しも追随させる
   const last = sheet.getLastRow();
   if (last > 1) sheet.getRange(2, 1, last - 1, COLS.length).clearContent();
   if (rows.length) {
@@ -554,6 +570,7 @@ function newRow_(c) {
   row.kind = c.kind;
   row.permalink = c.permalink;
   row.notify_count = 0;
+  row.renotify_count = 0;
   row.mute = false;
   return row;
 }

@@ -139,7 +139,7 @@ vm.runInContext(`const RealDate = Date; Date = class extends RealDate {
   static now() { return ${FIXED}; }
 };`, sandbox);
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/Code.gs'), 'utf8') +
-  '\nthis.__api = { scan, notify_, COLS, STATE, parseDue_, isRipe_, isMine_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
+  '\nthis.__api = { scan, notify_, COLS, STATE, parseDue_, isDueForStale_, isRipe_, isMine_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
 const api = sandbox.__api;
 const { scan, notify_, COLS, STATE } = api;
 const table = () => Object.fromEntries(grids.threads.slice(1).map((r) => [r[0], Object.fromEntries(COLS.map((c, i) => [c, r[i]]))]));
@@ -202,7 +202,7 @@ assert.deepStrictEqual(grids.threads.slice(1, 4).map((r) => r[COLS.indexOf('prio
 // 4) 通知: Mac 側が書いた一文があればそれを、無ければ定型文を使う。期限が近い件が先頭。2 回目は投稿しない。
 grids.notices.push([`C1:${T.ask}`, t[`C1:${T.ask}`].fingerprint, 'AI: 依頼を確認して返信', '']);
 grids.notices.push([`C1:${T.promiseRoot}`, '古い内容の指紋', 'AI: 古い一文', '']);
-const stale = (row, nowMs) => !row.last_notified_at && api.isRipe_(row, nowMs);
+const stale = api.isDueForStale_;
 notify_('stale', stale);
 assert.strictEqual(posted.length, 1);
 assert.strictEqual(posted[0].channel, 'CNOTIFY');
@@ -215,6 +215,25 @@ assert.ok(out[1].includes('期限 '));
 notify_('stale', stale);
 assert.strictEqual(posted.length, 1);
 assert.strictEqual(table()[`C1:${T.ask}`].notify_count, 1);
+
+// 4b) 対応がないまま 4 時間経つと、その件だけもう一度知らせる。再通知は 1 回まで。
+const backdate = (key, hours) => {
+  const r = grids.threads.find((row) => row[0] === key);
+  r[COLS.indexOf('last_notified_at')] = new Date(FIXED - hours * 36e5);
+};
+backdate(`C1:${T.ask}`, 3);
+notify_('stale', stale);
+assert.strictEqual(posted.length, 1);
+backdate(`C1:${T.ask}`, 5);
+notify_('stale', stale);
+assert.strictEqual(posted.length, 2);
+assert.strictEqual(posted[1].text.split('\n').length, 2);
+assert.ok(posted[1].text.includes('依頼を確認して返信'));
+assert.strictEqual(table()[`C1:${T.ask}`].renotify_count, 1);
+backdate(`C1:${T.ask}`, 5);
+notify_('stale', stale);
+assert.strictEqual(posted.length, 2);
+assert.strictEqual(grids.threads[0][COLS.indexOf('renotify_count')], 'renotify_count');
 
 // 5) 相手の最後の発言に本人が :done: を付けたら、AI を待たずに完了になる。判定待ちだった場合も取り消される。
 threads[`C1:${T.ask}`].push({ user: 'UA', text: '追加でこれ見てもらえますか', ts: T.more });
@@ -286,8 +305,10 @@ assert.ok(fitted[1].omitted_messages > 0);
 
 // 朝のまとめ: 自分の対応待ち 3 件。催促し直した相手待ちは載らない。
 notify_('digest', (row, nowMs) => api.isMine_(row) || api.isRipe_(row, nowMs));
-assert.strictEqual(posted.length, 2);
-assert.strictEqual(posted[1].text.split('\n').length, 4);
+assert.strictEqual(posted.length, 3);
+assert.strictEqual(posted[2].text.split('\n').length, 4);
+// 朝のまとめに載ると、その日の再通知は数え直す
+assert.strictEqual(table()[`C1:${T.promiseRoot}`].renotify_count, 0);
 
 console.log('OK');
 console.log(posted.map((p) => p.text).join('\n---\n'));
