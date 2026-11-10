@@ -69,23 +69,39 @@ function scan() {
   const started = Date.now();
   const timeUp = () => Date.now() - started > CFG.TIME_BUDGET_MS;
   const store = loadStore_();
+  const stat = {
+    候補: 0, 対象: 0, 取得: 0, 変化なし: 0, 判定待ちに追加: 0, 規則で完了: 0, 規則で対応不要: 0,
+    判定取り込み: 0, 取得失敗: 0, 時間切れで次回: 0,
+  };
   try {
     ensureSheet_(CFG.NOTICES_SHEET, NOTICE_COLS); // Mac 側が追記できるよう先に用意しておく
-    applyJudgments_(store);
+    stat.判定取り込み = applyJudgments_(store);
     const me = myUserId_();
     const groups = myGroups_(me);
-    const targets = pickTargets_(collectCandidates_(me, groups), store);
-    for (const row of targets) {
-      if (timeUp()) break;
+    const cands = collectCandidates_(me, groups);
+    const targets = pickTargets_(cands, store);
+    stat.候補 = cands.size;
+    stat.対象 = targets.length;
+    for (let i = 0; i < targets.length; i++) {
+      const row = targets[i];
+      if (timeUp()) {
+        stat.時間切れで次回 = targets.length - i;
+        break;
+      }
       let unit;
       try {
         unit = fetchUnit_(row, me);
       } catch (e) {
-        console.warn(`取得失敗 ${row.key}: ${e.message}`);
+        console.warn(`取得失敗 ${e.message}`);
+        stat.取得失敗++;
         continue;
       }
       row.checked_at = new Date();
-      if (!unit || unit.fingerprint === row.fingerprint || unit.fingerprint === row.pending_fp) continue;
+      stat.取得++;
+      if (!unit || unit.fingerprint === row.fingerprint || unit.fingerprint === row.pending_fp) {
+        stat.変化なし++;
+        continue;
+      }
       // 相手待ちのまま新しい発言があった（催促した、相手が途中経過を返した）場合は、そこから数え直す
       if (isOpen_(row) && !isMine_(row) && unit.latestDate.getTime() > toMs_(row.latest_ts)) {
         row.pending_since = unit.latestDate;
@@ -94,15 +110,18 @@ function scan() {
       }
       row.latest_ts = unit.latestDate;
       if (unit.doneByReaction) {
+        stat.規則で完了++;
         applyJudgment_(row, unit.fingerprint, {
           state: 'DONE', summary: row.summary || '（要約なし）', reason: '本人が完了のリアクションを付けた', next_action: '', due_at: '',
         });
       } else if (!unit.needsAi) {
+        stat.規則で対応不要++;
         applyJudgment_(row, unit.fingerprint, {
           state: 'NO_ACTION', summary: 'bot 投稿のみ', reason: '人の発言がないため AI 判定を省略', next_action: '', due_at: '',
         });
       } else {
         // 判定は Mac 側に任せる。結果が judgments シートに書かれるまで、状態は前回のまま
+        stat.判定待ちに追加++;
         row.pending_fp = unit.fingerprint;
         row.pending_input = JSON.stringify({
           me: me, groups: groups, done_reactions: CFG.DONE_REACTIONS,
@@ -113,20 +132,28 @@ function scan() {
   } finally {
     saveStore_(store);
     lock.releaseLock();
+    const rows = Array.from(store.values());
+    stat.判定待ち合計 = rows.filter((r) => r.pending_fp).length;
+    stat.対応待ち = rows.filter((r) => isActive_(r, Date.now())).length;
+    stat.秒 = Math.round((Date.now() - started) / 1000);
+    console.log(`scan ${logFields_(stat)}`);
   }
 }
 
 /** Mac 側が judgments シートに書いた判定のうち、いま判定待ちの内容に対するものを取り込む。 */
 function applyJudgments_(store) {
+  let applied = 0;
   readRows_(CFG.JUDGMENTS_SHEET, JUDGMENT_COLS).forEach((j) => {
     const row = store.get(j.key);
     if (!row || !row.pending_fp || row.pending_fp !== j.fingerprint) return;
     try {
       applyJudgment_(row, j.fingerprint, j);
+      applied++;
     } catch (e) {
-      console.warn(`判定の取り込み失敗 ${row.key}: ${e.message}`);
+      console.warn(`判定の取り込み失敗 ${e.message}`);
     }
   });
+  return applied;
 }
 
 /** 本人が所属するユーザーグループ。取得できなければグループメンションなしで続ける。 */
@@ -145,11 +172,15 @@ function myGroups_(me) {
 function collectCandidates_(me, groups) {
   const after = Utilities.formatDate(
     new Date(Date.now() - (CFG.LOOKBACK_DAYS + 1) * 864e5), CFG.TZ, 'yyyy-MM-dd');
-  const queries = [`<@${me}> after:${after}`, `is:dm after:${after}`, `from:<@${me}> after:${after}`]
-    .concat(groups.map((g) => `<!subteam^${g.id}> after:${after}`));
+  // ログには ID を含む検索語ではなく、経路の名前だけを出す
+  const queries = [
+    { label: '自分宛メンション', q: `<@${me}> after:${after}` },
+    { label: 'DM', q: `is:dm after:${after}` },
+    { label: '自分の発言', q: `from:<@${me}> after:${after}` },
+  ].concat(groups.map((g, i) => ({ label: `グループ宛${i + 1}`, q: `<!subteam^${g.id}> after:${after}` })));
   const ignored = ignoredChannels_();
   const cands = new Map();
-  for (const query of queries) {
+  for (const { label, q: query } of queries) {
     let count = 0;
     for (let page = 1; page <= 5; page++) {
       const res = slack_('search.messages', {
@@ -172,7 +203,7 @@ function collectCandidates_(me, groups) {
       const paging = (res.messages && res.messages.paging) || {};
       if (!matches.length || page >= (paging.pages || 1)) break;
     }
-    console.log(`検索 "${query}": ${count} 件`); // 0 件の検索があれば、その経路は拾えていない
+    console.log(`検索 経路=${label} 件数=${count}`); // 0 件の経路があれば、その検索は拾えていない
   }
   return cands;
 }
@@ -377,7 +408,10 @@ function isRipe_(row, nowMs) {
 function notifyStale() {
   const now = new Date();
   const hour = Number(Utilities.formatDate(now, CFG.TZ, 'H'));
-  if (!isWeekday_(now) || hour < CFG.WORK_START_HOUR || hour >= CFG.WORK_END_HOUR) return;
+  if (!isWeekday_(now) || hour < CFG.WORK_START_HOUR || hour >= CFG.WORK_END_HOUR) {
+    console.log('notify mode=stale 時間外のため送らない');
+    return;
+  }
   notify_('stale', isDueForStale_);
 }
 
@@ -391,7 +425,10 @@ function isDueForStale_(row, nowMs) {
 
 /** 毎朝、自分の対応待ち全件と、催促時期に達した相手待ちをまとめて 1 通投稿する。 */
 function morningDigest() {
-  if (!isWeekday_(new Date())) return;
+  if (!isWeekday_(new Date())) {
+    console.log('notify mode=digest 休日のため送らない');
+    return;
+  }
   notify_('digest', (row, nowMs) => isMine_(row) || isRipe_(row, nowMs));
 }
 
@@ -403,7 +440,13 @@ function notify_(mode, filter) {
     applyJudgments_(store);
     const nowMs = Date.now();
     const rows = Array.from(store.values()).filter((r) => isActive_(r, nowMs) && !isMuted_(r) && filter(r, nowMs));
-    if (!rows.length) return;
+    if (!rows.length) {
+      console.log(`notify mode=${mode} 投稿=0`);
+      return;
+    }
+    // 1 通に載るのは優先度順の上位だけ。通知済みの記録も、実際に載せた件にだけ付ける
+    const shown = sortByPriority_(rows, nowMs).slice(0, CFG.MAX_NOTICE_ITEMS);
+    const renotified = mode === 'stale' ? shown.filter((r) => r.last_notified_at).length : 0;
     const me = myUserId_();
     slack_('chat.postMessage', {
       channel: notifyChannel_(),
@@ -411,7 +454,11 @@ function notify_(mode, filter) {
       unfurl_links: false,
       unfurl_media: false,
     }, { bot: true, json: true });
-    rows.forEach((r) => {
+    console.log(`notify ${logFields_({
+      mode: mode, 対象: rows.length, 掲載: shown.length, 再通知: renotified,
+      自分の番: shown.filter(isMine_).length, 相手待ち: shown.filter((r) => !isMine_(r)).length,
+    })}`);
+    shown.forEach((r) => {
       r.notify_count = Number(r.notify_count || 0) + 1;
       // 朝のまとめに載っただけの新しい件は、通知時期に達した時点で個別にも知らせる
       if (!isRipe_(r, nowMs)) return;
@@ -608,6 +655,11 @@ function isOpen_(row) {
   return OPEN_STATES.some((s) => STATE[s] === row.state);
 }
 
+/** ログ用に「名前=値」を並べる（件数や秒数だけ。Slack の本文や要約は渡さない）。 */
+function logFields_(fields) {
+  return Object.keys(fields).map((k) => `${k}=${fields[k]}`).join(' ');
+}
+
 function isMine_(row) {
   return MINE_STATES.some((s) => STATE[s] === row.state);
 }
@@ -658,7 +710,7 @@ function checkSetup() {
   sheet_();
   ensureSheet_(CFG.JUDGMENTS_SHEET, JUDGMENT_COLS);
   ensureSheet_(CFG.NOTICES_SHEET, NOTICE_COLS);
-  console.log(`読み取り: ${user.user} (${user.user_id}) / 投稿: ${bot.user}`);
+  console.log(`読み取りトークン=${user.ok ? 'OK' : 'NG'} 投稿トークン=${bot.ok ? 'OK' : 'NG'} 通知先=設定済み`);
 }
 
 /** 手動実行で判定結果を確かめてから実行する。 */

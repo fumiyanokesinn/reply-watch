@@ -1,8 +1,8 @@
-.PHONY: test eval push pull open logs gas-create local-run local-install local-uninstall slack-validate slack-push slack-pull
+.PHONY: test eval push pull open logs gas-create local-run local-install local-uninstall log usage slack-validate slack-push slack-pull
 
 test:
 	node test/mock_run.js
-	node test/local_ai_test.mjs
+	REPLY_WATCH_QUIET=1 node test/local_ai_test.mjs
 
 # 仕分けプロンプトを合成データで実際の Claude Code に判定させる（プランの利用枠を使う）
 eval:
@@ -37,6 +37,14 @@ local-install:
 
 local-uninstall:
 	scripts/launchd.sh uninstall
+
+# 手元の AI 処理のログを追う
+log:
+	tail -n 50 -f $(HOME)/Library/Logs/reply-watch/local-ai.log
+
+# claude の利用量を日ごとに集計する（make usage DAYS=30）
+usage:
+	node scripts/local-ai.mjs usage $(or $(DAYS),7)
 
 slack-validate:
 	scripts/slack-manifest.sh validate

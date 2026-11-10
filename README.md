@@ -70,7 +70,10 @@ GAS  notifyStale（30 分毎）/ morningDigest（毎朝）  結果を取り込�
 
 ## 手元の AI 処理
 
-- `make local-install` で launchd に登録され、5 分毎に動く（`make local-uninstall` で解除）。ログは `~/Library/Logs/reply-watch.log`
+- `make local-install` で launchd に登録され、5 分毎に動く（`make local-uninstall` で解除）
+- ログは `~/Library/Logs/reply-watch/local-ai.log`（`make log` で追える）。1 行 1 イベントで、判定待ちの件数・判定結果の内訳・claude の呼び出しごとのトークン数と所要時間・失敗を記録する。Slack の本文や要約は書かない。5MB を超えたら `.1` に回す
+- `make usage`（`DAYS=30` で期間指定）で、claude の利用量を日ごと・用途ごとに集計できる。換算 $ は API 料金に換算した参考値で、プランでは請求されない
+- GAS 側の実行ログ（エディタの「実行数」）には、scan ごとに候補・取得・判定待ちへの追加・取り込み・失敗の件数、通知ごとに件数と再通知の件数を出す
 - 判定待ちが無い回は `claude` を起動しない
 - モデルは環境変数で変えられる（既定は仕分け `sonnet`、通知文 `haiku`）: `REPLY_WATCH_JUDGE_MODEL` / `REPLY_WATCH_NOTICE_MODEL`
 - プロンプトは `prompts/judge.md` と `prompts/notice.md`。直したら `make eval` で、合成したやり取りに対する判定を確かめられる（プランの利用枠を使う）

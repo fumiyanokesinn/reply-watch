@@ -139,7 +139,7 @@ vm.runInContext(`const RealDate = Date; Date = class extends RealDate {
   static now() { return ${FIXED}; }
 };`, sandbox);
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/Code.gs'), 'utf8') +
-  '\nthis.__api = { scan, notify_, COLS, STATE, parseDue_, isDueForStale_, isRipe_, isMine_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
+  '\nthis.__api = { scan, notify_, COLS, STATE, CFG, parseDue_, isDueForStale_, isRipe_, isMine_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
 const api = sandbox.__api;
 const { scan, notify_, COLS, STATE } = api;
 const table = () => Object.fromEntries(grids.threads.slice(1).map((r) => [r[0], Object.fromEntries(COLS.map((c, i) => [c, r[i]]))]));
@@ -309,6 +309,16 @@ assert.strictEqual(posted.length, 3);
 assert.strictEqual(posted[2].text.split('\n').length, 4);
 // 朝のまとめに載ると、その日の再通知は数え直す
 assert.strictEqual(table()[`C1:${T.promiseRoot}`].renotify_count, 0);
+
+// 1 通に載り切らなかった件は、通知済みにしない（次の通知で載る）
+const counts = () => Object.fromEntries(Object.values(table()).map((r) => [r.key, Number(r.notify_count || 0)]));
+const before = counts();
+api.CFG.MAX_NOTICE_ITEMS = 1;
+notify_('digest', (row, nowMs) => api.isMine_(row) || api.isRipe_(row, nowMs));
+api.CFG.MAX_NOTICE_ITEMS = 15;
+assert.ok(posted[3].text.includes('他 2 件はシートを参照'));
+const after = counts();
+assert.strictEqual(Object.keys(after).filter((k) => after[k] !== before[k]).length, 1);
 
 console.log('OK');
 console.log(posted.map((p) => p.text).join('\n---\n'));

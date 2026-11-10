@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LABEL=com.reply-watch.local-ai
 PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
-LOG=$HOME/Library/Logs/reply-watch.log
+# 処理のログは scripts/log.mjs が local-ai.log に書く。ここは起動失敗などの予期しない出力だけ
+LOG_DIR=$HOME/Library/Logs/reply-watch
+LOG=$LOG_DIR/launchd.log
 
 bin_dir() {
   local p d writable
@@ -59,10 +61,19 @@ case "${1:-}" in
   print) plist ;;
   install)
     mkdir -p "$(dirname "$PLIST")"
+    mkdir -p -m 700 "$LOG_DIR"
+    # ログの置き場所は本人専用にする（リンクや他人の持ち物なら中断）
+    if [ -L "$LOG_DIR" ] || [ ! -O "$LOG_DIR" ] || [ -L "$LOG" ] || { [ -e "$LOG" ] && [ ! -O "$LOG" ]; }; then
+      echo "$LOG_DIR がリンクか、本人の持ち物ではないため使えない" >&2
+      exit 1
+    fi
+    chmod 700 "$LOG_DIR"
+    (umask 077 && touch "$LOG")
+    chmod 600 "$LOG"
     plist >"$PLIST"
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
-    echo "登録完了: 5 分毎に実行。ログは $LOG"
+    echo "登録完了: 5 分毎に実行。ログは $LOG_DIR/local-ai.log（make log で追える）"
     ;;
   uninstall)
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true

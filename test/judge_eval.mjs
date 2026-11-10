@@ -1,6 +1,14 @@
 // 仕分けプロンプトを、合成したやり取りで実際の Claude Code に判定させて確かめる（プランの利用枠を使う）。
 // 実行: make eval
+import { mkdtempSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { io, judge } from '../scripts/local-ai.mjs';
+import { usage } from '../scripts/log.mjs';
+
+// 試験の利用量を本番のログに混ぜない
+process.env.REPLY_WATCH_LOG_DIR = mkdtempSync(join(realpathSync(tmpdir()), 'reply-watch-eval-'));
+process.env.REPLY_WATCH_QUIET = '1';
 
 const ME = 'UME';
 const env = (messages, kind = 'スレッド') => JSON.stringify({
@@ -75,4 +83,5 @@ CASES.forEach(([name, expected], i) => {
   if (r) console.log(`     要約=${r[3]} / 根拠=${r[4]} / 次=${r[5]} / 期限=${r[6]}`);
 });
 console.log(`${ok}/${CASES.length}`);
+usage(1).forEach((r) => console.log(`利用量: 呼出 ${r.calls} / 入力 ${r.input} / cache作成 ${r.cache_create} / cache読込 ${r.cache_read} / 出力 ${r.output} / 換算 $${r.cost_usd.toFixed(4)} / ${Math.round(r.sec)} 秒`));
 process.exit(ok === CASES.length ? 0 : 1);

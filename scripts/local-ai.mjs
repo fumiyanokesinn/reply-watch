@@ -8,6 +8,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { errorText, log, logFile, usage } from './log.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -122,7 +123,16 @@ export const io = {
       if (out.is_error || !out.structured_output) {
         throw new Error(`claude: ${/^[a-z_]{1,40}$/.test(out.subtype || '') ? out.subtype : '出力なし'}`);
       }
-      return out.structured_output;
+      const u = out.usage || {};
+      return {
+        data: out.structured_output,
+        usage: {
+          model: Object.keys(out.modelUsage || {}).join(',') || model,
+          in: u.input_tokens, out: u.output_tokens,
+          cache_create: u.cache_creation_input_tokens, cache_read: u.cache_read_input_tokens,
+          cost_usd: out.total_cost_usd, api_ms: out.duration_api_ms, turns: out.num_turns,
+        },
+      };
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -169,21 +179,50 @@ function pick(items, wanted) {
   return (items || []).filter((it) => wanted.has(it.key) && !seen.has(it.key) && seen.add(it.key));
 }
 
+/** claude を呼び、利用量と所要時間をログに残す。失敗した時も件数と時間は残す。 */
+function callClaude(session, model, system, schema, input, items) {
+  const started = Date.now();
+  try {
+    const { data, usage: u } = io.claude(model, system, schema, input);
+    log('INFO', 'claude.call', { session, items, input_chars: input.length, ms: Date.now() - started, ...u });
+    return data;
+  } catch (e) {
+    log('ERROR', 'claude.error', { session, model, items, input_chars: input.length, ms: Date.now() - started, error: errorText(e) });
+    throw e;
+  }
+}
+
+function countBy(rows, i) {
+  const n = {};
+  rows.forEach((r) => { n[r[i]] = (n[r[i]] || 0) + 1; });
+  return Object.entries(n).map(([k, v]) => `${k}:${v}`).join(',');
+}
+
 function prune(name) {
   const rows = io.readSheet(name).slice(1);
-  if (rows.length > CFG.KEEP_ROWS * 4) io.replaceRows(name, rows.slice(-CFG.KEEP_ROWS));
+  if (rows.length > CFG.KEEP_ROWS * 4) {
+    io.replaceRows(name, rows.slice(-CFG.KEEP_ROWS));
+    log('INFO', 'sheet.pruned', { sheet: name, before: rows.length, kept: CFG.KEEP_ROWS });
+  }
 }
 
 // ───────── セッション 1: 仕分け ─────────
 
 export function judge() {
+  const started = Date.now();
   const judged = done('judgments');
-  const pending = table(io.readSheet('threads'))
-    .filter((r) => r.pending_fp && r.pending_input && !judged.has(`${r.key}|${r.pending_fp}`))
-    .slice(0, CFG.MAX_PER_RUN);
+  const waiting = table(io.readSheet('threads')).filter((r) => r.pending_fp && r.pending_input);
+  const fresh = waiting.filter((r) => !judged.has(`${r.key}|${r.pending_fp}`));
+  const pending = fresh.slice(0, CFG.MAX_PER_RUN);
+  // 判定済みで GAS の取り込み待ちの件（waiting - fresh）は、次の scan で反映される
+  log('INFO', 'judge.start', {
+    waiting: waiting.length, awaiting_import: waiting.length - fresh.length, run: pending.length,
+    backlog: fresh.length - pending.length, model: CFG.JUDGE_MODEL,
+  });
   if (!pending.length) return 0;
   const system = readFileSync(join(ROOT, 'prompts/judge.md'), 'utf8');
   let count = 0;
+  let failed = 0;
   for (const batch of batches(pending, CFG.JUDGE_BATCH_ITEMS, CFG.JUDGE_BATCH_CHARS, (r) => r.pending_input.length)) {
     const threads = [];
     const fp = new Map();
@@ -192,61 +231,106 @@ export function judge() {
         threads.push({ key: r.key, ...JSON.parse(r.pending_input) });
         fp.set(r.key, r.pending_fp);
       } catch (e) {
-        console.error(`入力を読めない: ${safe(r.key)}`);
+        log('WARN', 'judge.bad_input', { key: safe(r.key) });
       }
     }
     if (!threads.length) continue;
+    let stage = 'claude';
     try {
-      const out = io.claude(CFG.JUDGE_MODEL, system, JUDGE_SCHEMA, `現在時刻: ${nowJst()} (JST)\n${JSON.stringify(threads)}`);
+      const out = callClaude('judge', CFG.JUDGE_MODEL, system, JUDGE_SCHEMA,
+        `現在時刻: ${nowJst()} (JST)\n${JSON.stringify(threads)}`, threads.length);
       const rows = pick(out.items, fp).filter((it) => STATES.includes(it.state)).map((it) =>
         [it.key, fp.get(it.key), it.state, it.summary, it.reason, it.next_action, it.due_at, nowJst()]);
+      stage = 'sheet';
       if (rows.length) io.appendRows('judgments', rows);
       count += rows.length;
+      log('INFO', 'judge.batch', {
+        asked: threads.length, judged: rows.length, missing: threads.length - rows.length,
+        states: countBy(rows, 2), with_due: rows.filter((r) => r[6]).length,
+      });
     } catch (e) {
       // 失敗した分は判定待ちのまま残り、次の起動でやり直す
-      console.error(`仕分け失敗（${threads.length} 件）: ${e.message}`);
+      failed++;
+      log('ERROR', 'judge.batch_failed', { stage, items: threads.length, error: errorText(e) });
     }
   }
   prune('judgments');
+  log('INFO', 'judge.end', { judged: count, failed_batches: failed, ms: Date.now() - started });
   return count;
 }
 
 // ───────── セッション 2: 通知の一文 ─────────
 
 export function notice() {
+  const started = Date.now();
   const written = done('notices');
-  const open = table(io.readSheet('threads'))
-    .filter((r) => OPEN_LABELS.includes(r.state) && r.fingerprint && !written.has(`${r.key}|${r.fingerprint}`))
-    .slice(0, CFG.MAX_PER_RUN);
+  const all = table(io.readSheet('threads')).filter((r) => OPEN_LABELS.includes(r.state) && r.fingerprint);
+  const fresh = all.filter((r) => !written.has(`${r.key}|${r.fingerprint}`));
+  const open = fresh.slice(0, CFG.MAX_PER_RUN);
+  log('INFO', 'notice.start', {
+    open: all.length, run: open.length, backlog: fresh.length - open.length, model: CFG.NOTICE_MODEL,
+  });
   if (!open.length) return 0;
   const system = readFileSync(join(ROOT, 'prompts/notice.md'), 'utf8');
   let count = 0;
+  let failed = 0;
   for (const batch of batches(open, CFG.NOTICE_BATCH_ITEMS, Infinity, () => 0)) {
     const fp = new Map(batch.map((r) => [r.key, r.fingerprint]));
     const input = batch.map((r) => ({
       key: r.key, state: r.state, summary: r.summary, reason: r.reason, next_action: r.next_action,
     }));
+    let stage = 'claude';
     try {
-      const out = io.claude(CFG.NOTICE_MODEL, system, NOTICE_SCHEMA, JSON.stringify(input));
+      const out = callClaude('notice', CFG.NOTICE_MODEL, system, NOTICE_SCHEMA, JSON.stringify(input), batch.length);
       const rows = pick(out.items, fp).filter((it) => it.line).map((it) => [it.key, fp.get(it.key), it.line, nowJst()]);
+      stage = 'sheet';
       if (rows.length) io.appendRows('notices', rows);
       count += rows.length;
+      log('INFO', 'notice.batch', { asked: batch.length, written: rows.length, missing: batch.length - rows.length });
     } catch (e) {
-      console.error(`通知文の作成失敗（${batch.length} 件）: ${e.message}`);
+      failed++;
+      log('ERROR', 'notice.batch_failed', { stage, items: batch.length, error: errorText(e) });
     }
   }
   prune('notices');
+  log('INFO', 'notice.end', { written: count, failed_batches: failed, ms: Date.now() - started });
   return count;
+}
+
+function printUsage(days) {
+  const rows = usage(days);
+  if (!rows.length) {
+    console.log(`直近 ${days} 日の記録なし（${logFile()}）`);
+    return;
+  }
+  const head = ['日付', '用途', '呼出', '失敗', '件数', '入力', 'cache作成', 'cache読込', '出力', '換算$', '秒'];
+  const body = rows.map((r) => [r.date, r.session, r.calls, r.errors, r.items, r.input, r.cache_create, r.cache_read,
+    r.output, r.cost_usd.toFixed(4), Math.round(r.sec)]);
+  const total = ['合計', '', ...[2, 3, 4, 5, 6, 7, 8].map((i) => body.reduce((s, r) => s + r[i], 0)),
+    body.reduce((s, r) => s + Number(r[9]), 0).toFixed(4), body.reduce((s, r) => s + r[10], 0)];
+  const all = [head, ...body, total];
+  const width = head.map((_, i) => Math.max(...all.map((r) => String(r[i]).length)));
+  all.forEach((r) => console.log(r.map((c, i) => String(c).padStart(width[i])).join('  ')));
+  console.log('換算$ は API 料金に換算した参考値（プランでは請求されない）。入力・cache・出力はトークン数');
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const cmd = process.argv[2];
-  // 5 分毎に動くので、何もしなかった回はログを出さない
-  const report = (label, n) => { if (n) console.log(`${nowJst()} ${label}: ${n} 件`); };
-  if (cmd === 'judge') report('仕分け', judge());
-  else if (cmd === 'notice') report('通知文', notice());
-  else {
-    console.error('usage: local-ai.mjs judge|notice');
+  if (cmd === 'usage') {
+    printUsage(Number(process.argv[3]) || 7);
+  } else if (cmd === 'judge' || cmd === 'notice') {
+    const started = Date.now();
+    log('INFO', 'run.start', { cmd, pid: process.pid });
+    try {
+      const n = cmd === 'judge' ? judge() : notice();
+      log('INFO', 'run.end', { cmd, done: n, ms: Date.now() - started });
+    } catch (e) {
+      // シートが読めない等。メッセージは exec / parseJson が決まった文言にしている
+      log('ERROR', 'run.failed', { cmd, error: errorText(e), ms: Date.now() - started });
+      process.exitCode = 1;
+    }
+  } else {
+    console.error('usage: local-ai.mjs judge|notice|usage [days]');
     process.exit(2);
   }
 }

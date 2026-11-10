@@ -1,6 +1,17 @@
 // scripts/local-ai.mjs を、シートと claude を差し替えて動かす。
 import assert from 'node:assert';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir as osTmpdir } from 'node:os';
+import { join } from 'node:path';
 import { batches, CFG, io, judge, notice } from '../scripts/local-ai.mjs';
+import { appendFileSync, chmodSync, existsSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { errorText, logFile, parseLine, usage } from '../scripts/log.mjs';
+
+// macOS の一時ディレクトリは /var → /private/var のリンクを含むので、実体の経路を使う
+const tmpdir = () => realpathSync(osTmpdir());
+const logDir = mkdtempSync(join(tmpdir(), 'reply-watch-log-'));
+process.env.REPLY_WATCH_LOG_DIR = logDir;
+const usageOf = (n) => ({ model: 'm', in: 10 * n, out: 5 * n, cache_create: 100, cache_read: 0, cost_usd: 0.001 * n });
 
 const sheets = {
   threads: [
@@ -21,13 +32,13 @@ io.claude = (model, system, schema, input) => {
   claudeCalls.push({ model, system, input });
   if (system.includes('仕分ける')) {
     // 頼んでいない key、重複、未知の state を混ぜる
-    return { items: [
+    return { usage: usageOf(1), data: { items: [
       { key: 'C1:1', state: 'UNREPLIED', summary: '=HYPERLINK("x")', reason: 'r', next_action: 'n', due_at: '' },
       { key: 'C1:1', state: 'DONE', summary: '重複', reason: 'r', next_action: '', due_at: '' },
       { key: 'C9:9', state: 'DONE', summary: '頼んでいない', reason: 'r', next_action: '', due_at: '' },
-    ] };
+    ] } };
   }
-  return { items: JSON.parse(input).map((i) => ({ key: i.key, line: `${i.summary}を進める` })) };
+  return { usage: usageOf(2), data: { items: JSON.parse(input).map((i) => ({ key: i.key, line: `${i.summary}を進める` })) } };
 };
 
 // 仕分け: 判定待ちのうち未判定の 1 件だけを AI に渡し、結果を 1 行だけ追記する。
@@ -56,6 +67,91 @@ sheets.threads.push(['C1:5', '', '', '', '', '', 'fp5', JSON.stringify({ message
 io.claude = () => { throw new Error('timeout'); };
 assert.strictEqual(judge(), 0);
 assert.strictEqual(sheets.judgments.length, 3);
+
+// ログ: 1 行 1 イベントで、件数・トークン数は残し、Slack 由来の文字列（要約や本文）は残さない。
+const lines = readFileSync(logFile(), 'utf8').trim().split('\n');
+const events = lines.map(parseLine);
+assert.ok(events.every(Boolean));
+['judge.start', 'claude.call', 'judge.batch', 'judge.end', 'notice.start', 'notice.batch', 'notice.end', 'claude.error', 'judge.batch_failed']
+  .forEach((ev) => assert.ok(events.some((e) => e.event === ev), ev));
+const call = events.find((e) => e.event === 'claude.call' && e.fields.session === 'judge');
+assert.deepStrictEqual([call.fields.items, call.fields.in, call.fields.out, call.fields.cache_create], ['1', '10', '5', '100']);
+assert.strictEqual(events.find((e) => e.event === 'judge.batch').fields.states, 'UNREPLIED:1');
+assert.strictEqual(events.find((e) => e.event === 'judge.batch_failed').fields.error, 'timeout');
+const text = readFileSync(logFile(), 'utf8');
+['HYPERLINK', '見てください', '設定の件', 'を進める', 'ログ待ち'].forEach((s) => assert.ok(!text.includes(s), s));
+
+// 利用量の集計: 日ごと・用途ごとに、呼出・件数・トークン・失敗を合計する。
+const u = usage(1);
+const byS = Object.fromEntries(u.map((r) => [r.session, r]));
+assert.deepStrictEqual([byS.judge.calls, byS.judge.errors, byS.judge.items, byS.judge.input, byS.judge.output], [1, 1, 1, 10, 5]);
+assert.deepStrictEqual([byS.notice.calls, byS.notice.items, byS.notice.input, byS.notice.cache_create], [1, 2, 20, 100]);
+
+// 細工された行や壊れた行があっても集計は止まらない。用途の名前は決まったものだけ。
+appendFileSync(logFile(), [
+  '2099-01-01 00:00:00 INFO claude.call session="\\q" items=1',
+  'garbage line',
+  `${new Date(Date.now() + 9 * 36e5).toISOString().slice(0, 19).replace('T', ' ')} INFO claude.call session=__proto__ items=Infinity in=-5 out=abc`,
+].join('\n') + '\n');
+const u2 = usage('not-a-number');
+assert.ok(u2.every((r) => ['judge', 'notice', '-'].includes(r.session)));
+const other = u2.find((r) => r.session === '-');
+assert.deepStrictEqual([other.calls, other.items, other.input, other.output], [1, 0, 0, 0]);
+assert.strictEqual(({}).polluted, undefined);
+
+// 保存先とファイルは本人専用。権限が緩ければ締め、リンクは辿らない。
+assert.strictEqual(statSync(logDir).mode & 0o777, 0o700);
+assert.strictEqual(statSync(logFile()).mode & 0o777, 0o600);
+chmodSync(logDir, 0o755);
+chmodSync(logFile(), 0o644);
+judge();
+assert.strictEqual(statSync(logDir).mode & 0o777, 0o700);
+assert.strictEqual(statSync(logFile()).mode & 0o777, 0o600);
+const victimDir = mkdtempSync(join(tmpdir(), 'reply-watch-victim-'));
+const victim = join(victimDir, 'victim.txt');
+writeFileSync(victim, 'original\n');
+const linkDir = mkdtempSync(join(tmpdir(), 'reply-watch-link-'));
+symlinkSync(victim, join(linkDir, 'local-ai.log'));
+process.env.REPLY_WATCH_LOG_DIR = linkDir;
+judge();
+assert.strictEqual(readFileSync(victim, 'utf8'), 'original\n');
+assert.deepStrictEqual(usage(1), []);
+const linkedDir = join(mkdtempSync(join(tmpdir(), 'reply-watch-link2-')), 'logs');
+symlinkSync(victimDir, linkedDir);
+process.env.REPLY_WATCH_LOG_DIR = linkedDir;
+judge();
+assert.strictEqual(readFileSync(victim, 'utf8'), 'original\n');
+// 他人が書き込める（sticky でない）ディレクトリの中は、確かめた後に差し替えられるので使わない
+const loose = mkdtempSync(join(tmpdir(), 'reply-watch-loose-'));
+chmodSync(loose, 0o777);
+process.env.REPLY_WATCH_LOG_DIR = join(loose, 'logs');
+judge();
+assert.ok(!existsSync(join(loose, 'logs', 'local-ai.log')));
+chmodSync(loose, 0o1777); // sticky なら他人は差し替えられないので可
+judge();
+assert.ok(existsSync(join(loose, 'logs', 'local-ai.log')));
+rmSync(loose, { recursive: true, force: true });
+
+// 途中にリンクを含む指定は、リンク先が本人専用の場所でも使わない（後で張り替えられるため）
+const base = mkdtempSync(join(tmpdir(), 'reply-watch-base-'));
+const target = mkdtempSync(join(tmpdir(), 'reply-watch-target-'));
+symlinkSync(target, join(base, 'jump'));
+process.env.REPLY_WATCH_LOG_DIR = join(base, 'jump', 'logs');
+judge();
+assert.ok(!existsSync(join(target, 'logs')));
+assert.deepStrictEqual(usage(1), []);
+[base, target].forEach((d) => rmSync(d, { recursive: true, force: true }));
+process.env.REPLY_WATCH_LOG_DIR = logDir;
+
+// エラー文言: 決まった文言はそのまま、パスなどを含む文言はコードだけにする。
+assert.strictEqual(errorText(new Error('gog: exit 1')), 'gog: exit 1');
+assert.strictEqual(errorText(new Error('claude: 出力を解析できない')), 'claude: 出力を解析できない');
+const enoent = Object.assign(new Error("ENOENT: no such file or directory, open '/Users/someone/x'"), { code: 'ENOENT' });
+assert.strictEqual(errorText(enoent), 'ENOENT');
+assert.strictEqual(errorText(new Error('see /tmp/x')), 'unexpected');
+
+rmSync(logDir, { recursive: true, force: true });
+[victimDir, linkDir].forEach((d) => rmSync(d, { recursive: true, force: true }));
 
 // まとめ方: 件数と文字数の上限で分ける。
 assert.deepStrictEqual(batches([1, 2, 3, 4, 5], 2, 100, () => 1).map((b) => b.length), [2, 2, 1]);
