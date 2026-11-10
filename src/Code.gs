@@ -103,7 +103,7 @@ function scan() {
     writeMeta_();
     stat.判定取り込み = applyJudgments_(store);
     const me = myUserId_();
-    stat.閉じた = applyCloseReactions_(store, me);
+    stat.閉じた = applyCloseActions_(store, me);
     const groups = myGroups_(me);
     const dmFlags = new Map();
     const cands = collectCandidates_(me, groups, dmFlags, timeUp);
@@ -544,7 +544,7 @@ function notify_(mode, filter) {
   try {
     applyJudgments_(store);
     const me = myUserId_();
-    const closed = applyCloseReactions_(store, me);
+    const closed = applyCloseActions_(store, me);
     const nowMs = Date.now();
     const rows = Array.from(store.values())
       .filter((r) => isActive_(r, nowMs) && !isMuted_(r) && !isClosed_(r) && filter(r, nowMs));
@@ -610,7 +610,7 @@ function composeNotice_(allRows, nowMs) {
   if (mine.length) parts.push(`*自分の対応待ち ${mine.length} 件*`, ...mine.map((r, i) => render(r, i)));
   if (waiting.length) parts.push(`*相手待ち（催促候補） ${waiting.length} 件*`, ...waiting.map((r, i) => render(r, mine.length + i)));
   if (sorted.length > rows.length) parts.push(`他 ${sorted.length - rows.length} 件はシートを参照`);
-  parts.push('_対応不要の件は、その番号のリアクションを付けると閉じる（スレッドに新しい動きがあれば戻る）_');
+  parts.push('_返事が要らない件は、このスレッドに番号を書く（例: 2 不要）か、番号のリアクションを付けると閉じる。元のスレッドに新しい発言があれば戻る_');
   return { text: parts.join('\n'), items: mine.concat(waiting) };
 }
 
@@ -628,11 +628,12 @@ function recordPost_(ts, items, nowMs) {
 }
 
 /**
- * 直近の通知に本人が付けた番号のリアクションを読み、その番号の件を閉じる。
+ * 直近の通知に本人が付けた番号のリアクションと、通知のスレッドへの本人の返信（例: 「2 不要」）を読み、その番号の件を閉じる。
  * 閉じるのは通知した時の内容（fingerprint）に対してだけ。スレッドに新しい動きがあれば通知に戻る。
+ * 新しく閉じた件は、通知のスレッドに bot が返信して知らせる（元のスレッドには何もしないので、相手には届かない）。
  * 読めなくても仕分けや通知は止めない。返り値は新しく閉じた件数。
  */
-function applyCloseReactions_(store, me) {
+function applyCloseActions_(store, me) {
   try {
     const cutoff = Date.now() - CFG.POSTS_KEEP_DAYS * 864e5;
     const posts = new Map();
@@ -645,32 +646,73 @@ function applyCloseReactions_(store, me) {
       }
     });
     if (!posts.size) return 0;
+    const channel = notifyChannel_();
     let closed = 0;
+    const close = (items, n, done) => {
+      const item = items[n - 1];
+      if (!item) return;
+      const row = store.get(item.key);
+      if (!row || String(row.fingerprint) !== item.fp || isClosed_(row)) return;
+      row.closed_fp = row.fingerprint;
+      done.push(n);
+      closed++;
+    };
     let cursor = '';
     for (let page = 0; page < 5; page++) {
-      const params = { channel: notifyChannel_(), oldest: String(Math.floor(cutoff / 1000)), limit: 200 };
+      const params = { channel: channel, oldest: String(Math.floor(cutoff / 1000)), limit: 200 };
       if (cursor) params.cursor = cursor;
       const res = slack_('conversations.history', params);
       (res.messages || []).forEach((m) => {
         const items = posts.get(String(m.ts));
         if (!items) return;
+        const done = [];
         (m.reactions || []).forEach((r) => {
-          const item = items[CFG.CLOSE_REACTIONS.indexOf(r.name)];
-          if (!item || (r.users || []).indexOf(me) < 0) return;
-          const row = store.get(item.key);
-          if (!row || String(row.fingerprint) !== item.fp || isClosed_(row)) return;
-          row.closed_fp = row.fingerprint;
-          closed++;
+          if ((r.users || []).indexOf(me) >= 0) close(items, CFG.CLOSE_REACTIONS.indexOf(r.name) + 1, done);
         });
+        if (Number(m.reply_count || 0) > 0) {
+          Utilities.sleep(CFG.SLACK_INTERVAL_MS);
+          const replies = slack_('conversations.replies', { channel: channel, ts: m.ts, limit: 200 }).messages || [];
+          replies.filter((x) => x.ts !== m.ts && x.user === me && !x.bot_id)
+            .forEach((x) => closeNumbers_(x.text, items.length).forEach((n) => close(items, n, done)));
+        }
+        if (!done.length) return;
+        try {
+          slack_('chat.postMessage', {
+            channel: channel, thread_ts: m.ts, unfurl_links: false, unfurl_media: false,
+            text: `閉じた: ${done.map((n) => `:${CFG.CLOSE_REACTIONS[n - 1]}:`).join(' ')}（スレッドに新しい発言があれば通知に戻る）`,
+          }, { bot: true, json: true });
+        } catch (e) {
+          console.warn(`閉じた知らせを送れない ${e.message}`);
+        }
       });
       cursor = res.response_metadata && res.response_metadata.next_cursor;
       if (!cursor) break;
     }
     return closed;
   } catch (e) {
-    console.warn(`閉じるリアクションを読めない ${e.message}`);
+    console.warn(`閉じる操作を読めない ${e.message}`);
     return 0;
   }
+}
+
+/**
+ * 通知のスレッドへの本人の返信から、閉じる番号を読む。
+ * 先頭に並べた番号（「2 不要」「1,3 済」「①②」「:two: 不要」）か、先頭の「全部」「全て」「すべて」だけを読む
+ * （本文の途中の数字、例えば日付は読まない）。count を超える番号は無視する。
+ */
+function closeNumbers_(text, count) {
+  let s = String(text || '')
+    .replace(/[\u2460-\u2469]/g, (c) => ` ${c.charCodeAt(0) - 0x245f} `)
+    .replace(/:([a-z_]+):/g, (all, name) => {
+      const i = CFG.CLOSE_REACTIONS.indexOf(name);
+      return i >= 0 ? ` ${i + 1} ` : all;
+    })
+    .normalize('NFKC').trim();
+  if (/^(全部|全て|すべて)/.test(s)) return Array.from({ length: count }, (_, i) => i + 1);
+  const m = /^\d{1,2}(?:[\s,、・]*\d{1,2}(?!\d|\/|:|月|日|時))*/.exec(s);
+  if (!m) return [];
+  if (/^\d{1,2}(?:\/|:|月|日|時)/.test(s)) return []; // 日付や時刻で始まる返信は番号として読まない
+  return Array.from(new Set(m[0].split(/[^\d]+/).filter(String).map(Number))).filter((n) => n >= 1 && n <= count);
 }
 
 /** 通知文を作った時の判定を表す識別子。scripts/local-ai.mjs の noticeId と同じ形。 */

@@ -42,7 +42,8 @@ const grids = {}; // シート名 → 2 次元配列
 const posted = [];
 const calls = { replies: 0, external: [], queries: [] };
 const extraMentions = [];
-const notifyHistory = []; // 通知先チャンネルの投稿（新しい順）
+const notifyHistory = [];
+const threadPosts = []; // 通知先チャンネルの投稿（新しい順）
 
 const response = (code, body) => ({
   getResponseCode: () => code, getContentText: () => JSON.stringify(body), getHeaders: () => ({}),
@@ -94,7 +95,12 @@ function slack(url, req) {
   }
   if (method === 'chat.postMessage') {
     assert.ok(req.headers.Authorization.includes('xoxb-'));
-    posted.push(JSON.parse(req.payload));
+    const payload = JSON.parse(req.payload);
+    if (payload.thread_ts) {
+      threadPosts.push(payload); // 通知のスレッドへの返信（閉じた知らせ）
+      return response(200, { ok: true, ts: `${nowSec}.8` });
+    }
+    posted.push(payload);
     const postTs = `${nowSec}.90000${posted.length}`;
     notifyHistory.unshift({ user: 'UBOT', ts: postTs, text: posted.at(-1).text, reactions: [] });
     return response(200, { ok: true, ts: postTs });
@@ -146,7 +152,7 @@ vm.runInContext(`const RealDate = Date; Date = class extends RealDate {
   static now() { return ${FIXED}; }
 };`, sandbox);
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/Code.gs'), 'utf8') +
-  '\nthis.__api = { scan, notify_, COLS, STATE, CFG, parseDue_, isDueForStale_, isActive_, isRipe_, isMine_, isClosed_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
+  '\nthis.__api = { scan, notify_, COLS, STATE, CFG, parseDue_, isDueForStale_, isActive_, isRipe_, isMine_, isClosed_, closeNumbers_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
 const api = sandbox.__api;
 const { scan, notify_, COLS, STATE } = api;
 api.CFG.INCLUDE_DM = true; // DM を含めた流れを先に確かめ、最後に外した場合を確かめる
@@ -222,7 +228,7 @@ assert.strictEqual(posted.length, 1);
 assert.strictEqual(posted[0].channel, 'CNOTIFY');
 const out = posted[0].text.split('\n').filter((l) => !l.startsWith('　　ボール: '));
 // 2 時間前のグループメンションは放置時間に達していないので載らない
-const heads = [`<@${ME}> *自分の対応待ち 2 件*`, ':one: [高] 要約(PROMISED) → 返信する', ':two: [中] AI: 依頼を確認して返信', '*相手待ち（催促候補） 1 件*', ':three: [中] 要約(WAITING_OTHERS) → 催促する', '_対応不要の件は'];
+const heads = [`<@${ME}> *自分の対応待ち 2 件*`, ':one: [高] 要約(PROMISED) → 返信する', ':two: [中] AI: 依頼を確認して返信', '*相手待ち（催促候補） 1 件*', ':three: [中] 要約(WAITING_OTHERS) → 催促する', '_返事が要らない件は'];
 assert.strictEqual(out.length, heads.length);
 heads.forEach((h, i) => assert.ok(out[i].startsWith(h), `${i}: ${out[i]}`));
 assert.ok(out[1].includes('期限 '));
@@ -248,6 +254,9 @@ assert.ok(!posted[0].text.includes('確認で書いたボール'));
   assert.ok(api.isClosed_(tc[closeKey]));
   // 内容が変わった後は、同じリアクションが残っていても閉じない
   assert.ok(!api.isClosed_({ ...tc[closeKey], fingerprint: 'new' }));
+  assert.deepStrictEqual(threadPosts.map((x) => [x.thread_ts, x.text.split('（')[0]]), [[post.ts, '閉じた: :three:']]);
+  scan(); // 閉じ済みの件は、もう一度知らせない
+  assert.strictEqual(threadPosts.length, 1);
   // 閉じた件は通知の対象から外れる
   const n = posted.length;
   notify_('digest', (row) => row.key === closeKey);
@@ -255,7 +264,41 @@ assert.ok(!posted[0].text.includes('確認で書いたボール'));
   // 以降のテストに影響しないよう元に戻す
   post.reactions = [];
   grids.threads.find((r) => r[0] === closeKey)[COLS.indexOf('closed_fp')] = '';
+
+  // 通知のスレッドに本人が番号を書いても閉じる。他人の返信・bot の返信・本文途中の数字では閉じない
+  post.reply_count = 3;
+  threads[`CNOTIFY:${post.ts}`] = [
+    { user: 'UBOT', ts: post.ts, text: post.text },
+    { user: 'UX', ts: `${nowSec}.1`, text: '1 不要' },
+    { user: ME, bot_id: 'B1', ts: `${nowSec}.2`, text: '1' },
+    { user: ME, ts: `${nowSec}.3`, text: '別スレで 11/09 に回答済み' },
+    { user: ME, ts: `${nowSec}.4`, text: '３ 不要' },
+  ];
+  scan();
+  const tr = table();
+  assert.ok(api.isClosed_(tr[closeKey]));
+  assert.ok(!api.isClosed_(tr[`C1:${T.promiseRoot}`]));
+  assert.ok(!api.isClosed_(tr[`C1:${T.ask}`]));
+  assert.strictEqual(threadPosts.length, 2);
+  post.reply_count = 0;
+  grids.threads.find((r) => r[0] === closeKey)[COLS.indexOf('closed_fp')] = '';
 }
+
+// 通知のスレッドへの返信から読む番号: 先頭の番号の並びと「全部」だけ。日付や途中の数字は読まない
+const nums = (t) => Array.from(api.closeNumbers_(t, 5));
+assert.deepStrictEqual(nums('2 不要'), [2]);
+assert.deepStrictEqual(nums('1,3 済'), [1, 3]);
+assert.deepStrictEqual(nums('1、3、5 返事不要'), [1, 3, 5]);
+assert.deepStrictEqual(nums('①② 不要'), [1, 2]);
+assert.deepStrictEqual(nums(':two: :four: いらない'), [2, 4]);
+assert.deepStrictEqual(nums('２ 不要'), [2]);
+assert.deepStrictEqual(nums('全部不要'), [1, 2, 3, 4, 5]);
+assert.deepStrictEqual(nums('2 不要 11/09 に回答済み'), [2]);
+assert.deepStrictEqual(nums('11/09 に回答済み'), []);
+assert.deepStrictEqual(nums('3日に返す'), []);
+assert.deepStrictEqual(nums('10:00 に対応'), []);
+assert.deepStrictEqual(nums('不要 2'), []);
+assert.deepStrictEqual(nums('7 不要'), []);
 
 // 4b) 対応がないまま 4 時間経つと、その件だけもう一度知らせる。再通知は 1 回まで。
 const backdate = (key, hours) => {
