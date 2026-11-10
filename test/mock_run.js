@@ -42,6 +42,7 @@ const grids = {}; // シート名 → 2 次元配列
 const posted = [];
 const calls = { replies: 0, external: [], queries: [] };
 const extraMentions = [];
+const notifyHistory = []; // 通知先チャンネルの投稿（新しい順）
 
 const response = (code, body) => ({
   getResponseCode: () => code, getContentText: () => JSON.stringify(body), getHeaders: () => ({}),
@@ -88,12 +89,15 @@ function slack(url, req) {
     return response(200, { ok: true, messages: threads[`${q.channel}:${q.ts}`] });
   }
   if (method === 'conversations.history') {
+    if (q.channel === 'CNOTIFY') return response(200, { ok: true, messages: notifyHistory });
     return response(200, { ok: true, messages: q.channel === 'D1' ? dmHistory.slice().reverse() : [] });
   }
   if (method === 'chat.postMessage') {
     assert.ok(req.headers.Authorization.includes('xoxb-'));
     posted.push(JSON.parse(req.payload));
-    return response(200, { ok: true });
+    const postTs = `${nowSec}.90000${posted.length}`;
+    notifyHistory.unshift({ user: 'UBOT', ts: postTs, text: posted.at(-1).text, reactions: [] });
+    return response(200, { ok: true, ts: postTs });
   }
   throw new Error(`unexpected ${method}`);
 }
@@ -142,7 +146,7 @@ vm.runInContext(`const RealDate = Date; Date = class extends RealDate {
   static now() { return ${FIXED}; }
 };`, sandbox);
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/Code.gs'), 'utf8') +
-  '\nthis.__api = { scan, notify_, COLS, STATE, CFG, parseDue_, isDueForStale_, isActive_, isRipe_, isMine_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
+  '\nthis.__api = { scan, notify_, COLS, STATE, CFG, parseDue_, isDueForStale_, isActive_, isRipe_, isMine_, isClosed_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
 const api = sandbox.__api;
 const { scan, notify_, COLS, STATE } = api;
 api.CFG.INCLUDE_DM = true; // DM を含めた流れを先に確かめ、最後に外した場合を確かめる
@@ -218,7 +222,7 @@ assert.strictEqual(posted.length, 1);
 assert.strictEqual(posted[0].channel, 'CNOTIFY');
 const out = posted[0].text.split('\n').filter((l) => !l.startsWith('　　ボール: '));
 // 2 時間前のグループメンションは放置時間に達していないので載らない
-const heads = [`<@${ME}> *自分の対応待ち 2 件*`, '• [高] 要約(PROMISED) → 返信する', '• [中] AI: 依頼を確認して返信', '*相手待ち（催促候補） 1 件*', '• [中] 要約(WAITING_OTHERS) → 催促する'];
+const heads = [`<@${ME}> *自分の対応待ち 2 件*`, ':one: [高] 要約(PROMISED) → 返信する', ':two: [中] AI: 依頼を確認して返信', '*相手待ち（催促候補） 1 件*', ':three: [中] 要約(WAITING_OTHERS) → 催促する', '_対応不要の件は'];
 assert.strictEqual(out.length, heads.length);
 heads.forEach((h, i) => assert.ok(out[i].startsWith(h), `${i}: ${out[i]}`));
 assert.ok(out[1].includes('期限 '));
@@ -231,6 +235,28 @@ assert.ok(posted[0].text.includes('\n　　ボール: 【未着手】返信す�
 // 確認ステップの ball（シートだけ）は通知に出ない
 assert.ok(!posted[0].text.includes('確認で書いたボール'));
 
+// 4a) 通知に本人が番号のリアクションを付けると、その件を閉じる。他人のリアクションや番号以外は効かない。
+//     閉じた件は通知に載らず、スレッドに新しい発言があると戻る
+{
+  const closeKey = `C3:${T.waitRoot}`; // 3 番目（相手待ち）
+  const post = notifyHistory.find((m) => m.text === posted[0].text);
+  post.reactions = [{ name: 'two', users: ['UX'] }, { name: 'tada', users: [ME] }, { name: 'three', users: [ME] }];
+  scan();
+  const tc = table();
+  assert.strictEqual(tc[closeKey].closed_fp, tc[closeKey].fingerprint);
+  assert.strictEqual(tc[`C1:${T.ask}`].closed_fp, '');
+  assert.ok(api.isClosed_(tc[closeKey]));
+  // 内容が変わった後は、同じリアクションが残っていても閉じない
+  assert.ok(!api.isClosed_({ ...tc[closeKey], fingerprint: 'new' }));
+  // 閉じた件は通知の対象から外れる
+  const n = posted.length;
+  notify_('digest', (row) => row.key === closeKey);
+  assert.strictEqual(posted.length, n);
+  // 以降のテストに影響しないよう元に戻す
+  post.reactions = [];
+  grids.threads.find((r) => r[0] === closeKey)[COLS.indexOf('closed_fp')] = '';
+}
+
 // 4b) 対応がないまま 4 時間経つと、その件だけもう一度知らせる。再通知は 1 回まで。
 const backdate = (key, hours) => {
   const r = grids.threads.find((row) => row[0] === key);
@@ -242,7 +268,7 @@ assert.strictEqual(posted.length, 1);
 backdate(`C1:${T.ask}`, 5);
 notify_('stale', stale);
 assert.strictEqual(posted.length, 2);
-assert.strictEqual(posted[1].text.split('\n').filter((l) => !l.startsWith('　　ボール: ')).length, 2);
+assert.strictEqual(posted[1].text.split('\n').filter((l) => !l.startsWith('　　ボール: ')).length, 3);
 assert.ok(posted[1].text.includes('依頼を確認して返信'));
 assert.strictEqual(table()[`C1:${T.ask}`].renotify_count, 1);
 backdate(`C1:${T.ask}`, 5);
@@ -321,7 +347,7 @@ assert.ok(fitted[1].omitted_messages > 0);
 // 朝のまとめ: 自分の対応待ち 3 件。催促し直した相手待ちは載らない。
 notify_('digest', (row, nowMs) => api.isMine_(row) || api.isRipe_(row, nowMs));
 assert.strictEqual(posted.length, 3);
-assert.strictEqual(posted[2].text.split('\n').filter((l) => !l.startsWith('　　ボール: ')).length, 4);
+assert.strictEqual(posted[2].text.split('\n').filter((l) => !l.startsWith('　　ボール: ')).length, 5);
 // 朝のまとめに載ると、その日の再通知は数え直す
 assert.strictEqual(table()[`C1:${T.promiseRoot}`].renotify_count, 0);
 

@@ -24,6 +24,9 @@ const CFG = {
   REVERIFY_HOURS: 24, // 対応が残っている件は、判定からこの時間が経つと Slack を調べ直す（scripts/local-ai.mjs と揃える）
   INCLUDE_DM: false, // DM（グループ DM 含む）を対象にするか。false の間は拾わず、既にある DM の件も追跡・通知しない
   DONE_REACTIONS: ['done', 'white_check_mark'], // 本人が付けたら対応完了として扱うリアクション
+  // 通知の各件に付ける番号。本人が通知にこのリアクションを付けたら、その件を閉じる（スレッドに新しい動きがあれば戻る）
+  CLOSE_REACTIONS: ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'keycap_ten'],
+  POSTS_KEEP_DAYS: 3, // 通知へのリアクションを読む期間
   LOOKBACK_DAYS: 14, // 新規に拾う範囲（追跡を打ち切る GIVE_UP_DAYS と揃える）
   REMIND_AFTER_HOURS: 3, // 自分の対応待ち: 個別リマインドまでの放置時間（優先度「中」になる時間でもある）
   RENOTIFY_AFTER_HOURS: 4, // 個別通知（または朝のまとめ）から対応がないまま、この時間が経ったらもう一度知らせる
@@ -33,7 +36,7 @@ const CFG = {
   DUE_SOON_HOURS: 24, // 期限までこの時間を切ったら優先度「高」にして、放置時間に関わらず通知する
   DUE_NEAR_HOURS: 72, // 期限までこの時間を切ったら優先度「中」以上
   GIVE_UP_DAYS: 14, // 動きがないままこの日数を過ぎた件は追跡と通知をやめる（シートには残る）
-  MAX_NOTICE_ITEMS: 15, // 1 通に載せる件数の上限（優先度順）
+  MAX_NOTICE_ITEMS: 10, // 1 通に載せる件数の上限（優先度順）。番号のリアクションの数まで
   WORK_START_HOUR: 10, // 個別リマインドを出す時間帯（平日のみ）
   WORK_END_HOUR: 19,
   RECHECK_CLOSED_HOURS: 6, // 完了・対応不要のスレッドを読み直す間隔
@@ -47,6 +50,7 @@ const CFG = {
   SHEET_NAME: 'threads',
   JUDGMENTS_SHEET: 'judgments', // Mac 側だけが追記する
   NOTICES_SHEET: 'notices', // Mac 側だけが追記する
+  POSTS_SHEET: 'posts', // GAS だけが書く。投稿した通知と、その番号の件
   TZ: 'Asia/Tokyo',
 };
 
@@ -74,10 +78,11 @@ const ACTION_LABELS = {
 const COLS = [
   'key', 'kind', 'permalink', 'state', 'priority', 'summary', 'reason', 'next_action',
   'due_at', 'pending_since', 'latest_ts', 'fingerprint', 'judged_at', 'checked_at',
-  'last_notified_at', 'notify_count', 'mute', 'pending_fp', 'pending_input', 'renotify_count', 'dm', 'pr_review', 'pending_at', 'judge_version', 'verify_note', 'ball', 'action_type',
+  'last_notified_at', 'notify_count', 'mute', 'pending_fp', 'pending_input', 'renotify_count', 'dm', 'pr_review', 'pending_at', 'judge_version', 'verify_note', 'ball', 'action_type', 'closed_fp',
 ];
 const JUDGMENT_COLS = ['key', 'fingerprint', 'state', 'summary', 'reason', 'next_action', 'due_at', 'judged_at', 'pr_review', 'judge_version', 'verify_note', 'ball', 'action_type'];
 const NOTICE_COLS = ['key', 'fingerprint', 'line', 'written_at'];
+const POST_COLS = ['ts', 'posted_at', 'items']; // items は [{ key, fp }] の JSON（番号の順）
 const META_SHEET = 'meta'; // GAS が書き、Mac 側が読む設定（判定の版など）
 const META_COLS = ['name', 'value'];
 
@@ -91,13 +96,14 @@ function scan() {
   const store = loadStore_();
   const stat = {
     候補: 0, 対象: 0, 取得: 0, 変化なし: 0, 判定待ちに追加: 0, 規則で完了: 0, 規則で対応不要: 0,
-    判定取り込み: 0, 取得失敗: 0, 時間切れで次回: 0, 除外botのスレッド: 0,
+    判定取り込み: 0, 取得失敗: 0, 時間切れで次回: 0, 除外botのスレッド: 0, 閉じた: 0,
   };
   try {
     ensureSheet_(CFG.NOTICES_SHEET, NOTICE_COLS); // Mac 側が追記できるよう先に用意しておく
     writeMeta_();
     stat.判定取り込み = applyJudgments_(store);
     const me = myUserId_();
+    stat.閉じた = applyCloseReactions_(store, me);
     const groups = myGroups_(me);
     const dmFlags = new Map();
     const cands = collectCandidates_(me, groups, dmFlags, timeUp);
@@ -537,24 +543,28 @@ function notify_(mode, filter) {
   const store = loadStore_();
   try {
     applyJudgments_(store);
+    const me = myUserId_();
+    const closed = applyCloseReactions_(store, me);
     const nowMs = Date.now();
-    const rows = Array.from(store.values()).filter((r) => isActive_(r, nowMs) && !isMuted_(r) && filter(r, nowMs));
+    const rows = Array.from(store.values())
+      .filter((r) => isActive_(r, nowMs) && !isMuted_(r) && !isClosed_(r) && filter(r, nowMs));
     if (!rows.length) {
-      console.log(`notify mode=${mode} 投稿=0`);
+      console.log(`notify mode=${mode} 投稿=0 閉じた=${closed}`);
       return;
     }
     // 1 通に載るのは優先度順の上位だけ。通知済みの記録も、実際に載せた件にだけ付ける
-    const shown = sortByPriority_(rows, nowMs).slice(0, CFG.MAX_NOTICE_ITEMS);
+    const notice = composeNotice_(rows, nowMs);
+    const shown = notice.items;
     const renotified = mode === 'stale' ? shown.filter((r) => r.last_notified_at).length : 0;
-    const me = myUserId_();
-    slack_('chat.postMessage', {
+    const res = slack_('chat.postMessage', {
       channel: notifyChannel_(),
-      text: `<@${me}> ${composeNotice_(rows, nowMs)}`,
+      text: `<@${me}> ${notice.text}`,
       unfurl_links: false,
       unfurl_media: false,
     }, { bot: true, json: true });
+    recordPost_(res.ts, shown, nowMs);
     console.log(`notify ${logFields_({
-      mode: mode, 対象: rows.length, 掲載: shown.length, 再通知: renotified,
+      mode: mode, 対象: rows.length, 掲載: shown.length, 再通知: renotified, 閉じた: closed,
       自分の番: shown.filter(isMine_).length, 相手待ち: shown.filter((r) => !isMine_(r)).length,
     })}`);
     shown.forEach((r) => {
@@ -571,7 +581,10 @@ function notify_(mode, filter) {
   }
 }
 
-/** 各件の一文は Mac 側の AI が notices シートに書いたものを使う。まだ無い件は定型文で出す。 */
+/**
+ * 各件の一文は Mac 側の AI が notices シートに書いたものを使う。まだ無い件は定型文で出す。
+ * 返すのは本文と、載せた件（番号の順）。
+ */
 function composeNotice_(allRows, nowMs) {
   const sorted = sortByPriority_(allRows, nowMs);
   const rows = sorted.slice(0, CFG.MAX_NOTICE_ITEMS);
@@ -581,23 +594,83 @@ function composeNotice_(allRows, nowMs) {
   readRows_(CFG.NOTICES_SHEET, NOTICE_COLS).forEach((n) => written.set(`${n.key}|${n.fingerprint}`, n.line));
   const line = (r) => written.get(`${r.key}|${noticeId_(r)}`) ||
     `${r.summary} → ${r.next_action || (isMine_(r) ? '対応する' : '催促する')}`;
-  const render = (r) => {
+  const render = (r, i) => {
     const h = hours(r);
     const meta = [r.state, h >= 48 ? `${Math.floor(h / 24)}営業日経過` : `${h}時間経過`];
     if (due(r)) meta.push(`期限 ${due(r)}`);
     // 確認ステップの ball は他のチャンネルや DM を読んで書かれうるので、公開の通知には出さない（シートにだけ残す）。
     // 通知には、元のスレッドだけを読んだ一次判定の next_action と、決まった値の対応の種類だけを出す
     const ball = r.next_action;
-    return `• [${priority_(r, nowMs)}] ${cleanLine_(line(r))}（${meta.join('・')}）${link_(r.permalink)}` +
+    return `:${CFG.CLOSE_REACTIONS[i]}: [${priority_(r, nowMs)}] ${cleanLine_(line(r))}（${meta.join('・')}）${link_(r.permalink)}` +
       (ball ? `\n　　ボール: ${ACTION_LABELS[r.action_type] ? `【${ACTION_LABELS[r.action_type]}】` : ''}${cleanLine_(ball)}` : '');
   };
   const mine = rows.filter(isMine_);
   const waiting = rows.filter((r) => !isMine_(r));
   const parts = [];
-  if (mine.length) parts.push(`*自分の対応待ち ${mine.length} 件*`, ...mine.map(render));
-  if (waiting.length) parts.push(`*相手待ち（催促候補） ${waiting.length} 件*`, ...waiting.map(render));
+  if (mine.length) parts.push(`*自分の対応待ち ${mine.length} 件*`, ...mine.map((r, i) => render(r, i)));
+  if (waiting.length) parts.push(`*相手待ち（催促候補） ${waiting.length} 件*`, ...waiting.map((r, i) => render(r, mine.length + i)));
   if (sorted.length > rows.length) parts.push(`他 ${sorted.length - rows.length} 件はシートを参照`);
-  return parts.join('\n');
+  parts.push('_対応不要の件は、その番号のリアクションを付けると閉じる（スレッドに新しい動きがあれば戻る）_');
+  return { text: parts.join('\n'), items: mine.concat(waiting) };
+}
+
+/** 投稿した通知と、その番号の件を posts シートに残す（古いものは消す）。 */
+function recordPost_(ts, items, nowMs) {
+  if (!ts) return;
+  const sheet = ensureSheet_(CFG.POSTS_SHEET, POST_COLS);
+  const cutoff = nowMs - CFG.POSTS_KEEP_DAYS * 864e5;
+  const kept = readRows_(CFG.POSTS_SHEET, POST_COLS).filter((p) => toMs_(p.posted_at) > cutoff)
+    .map((p) => POST_COLS.map((c) => p[c]));
+  kept.push([String(ts), new Date(nowMs), JSON.stringify(items.map((r) => ({ key: r.key, fp: String(r.fingerprint) })))]);
+  const last = sheet.getLastRow();
+  if (last > 1) sheet.getRange(2, 1, last - 1, POST_COLS.length).clearContent();
+  sheet.getRange(2, 1, kept.length, POST_COLS.length).setValues(kept.map((v) => v.map(cell_)));
+}
+
+/**
+ * 直近の通知に本人が付けた番号のリアクションを読み、その番号の件を閉じる。
+ * 閉じるのは通知した時の内容（fingerprint）に対してだけ。スレッドに新しい動きがあれば通知に戻る。
+ * 読めなくても仕分けや通知は止めない。返り値は新しく閉じた件数。
+ */
+function applyCloseReactions_(store, me) {
+  try {
+    const cutoff = Date.now() - CFG.POSTS_KEEP_DAYS * 864e5;
+    const posts = new Map();
+    readRows_(CFG.POSTS_SHEET, POST_COLS).forEach((p) => {
+      if (toMs_(p.posted_at) <= cutoff) return;
+      try {
+        posts.set(String(p.ts), JSON.parse(p.items));
+      } catch (e) {
+        // 壊れた行は読まない
+      }
+    });
+    if (!posts.size) return 0;
+    let closed = 0;
+    let cursor = '';
+    for (let page = 0; page < 5; page++) {
+      const params = { channel: notifyChannel_(), oldest: String(Math.floor(cutoff / 1000)), limit: 200 };
+      if (cursor) params.cursor = cursor;
+      const res = slack_('conversations.history', params);
+      (res.messages || []).forEach((m) => {
+        const items = posts.get(String(m.ts));
+        if (!items) return;
+        (m.reactions || []).forEach((r) => {
+          const item = items[CFG.CLOSE_REACTIONS.indexOf(r.name)];
+          if (!item || (r.users || []).indexOf(me) < 0) return;
+          const row = store.get(item.key);
+          if (!row || String(row.fingerprint) !== item.fp || isClosed_(row)) return;
+          row.closed_fp = row.fingerprint;
+          closed++;
+        });
+      });
+      cursor = res.response_metadata && res.response_metadata.next_cursor;
+      if (!cursor) break;
+    }
+    return closed;
+  } catch (e) {
+    console.warn(`閉じるリアクションを読めない ${e.message}`);
+    return 0;
+  }
 }
 
 /** 通知文を作った時の判定を表す識別子。scripts/local-ai.mjs の noticeId と同じ形。 */
@@ -663,7 +736,7 @@ function ensureSheet_(name, cols) {
     sheet.getRange(1, 1, 1, cols.length).setValues([cols]);
     sheet.setFrozenRows(1);
     // ts を含む列が数値に化けないよう、全列を文字列扱いにしておく（日付は書き込み時に Date で入る）
-    ['key', 'fingerprint', 'pending_fp'].filter((c) => cols.indexOf(c) >= 0).forEach((c) =>
+    ['key', 'fingerprint', 'pending_fp', 'closed_fp', 'ts'].filter((c) => cols.indexOf(c) >= 0).forEach((c) =>
       sheet.getRange(1, cols.indexOf(c) + 1, sheet.getMaxRows(), 1).setNumberFormat('@'));
   } else {
     // 列を足した時に見出しを追随させる（Mac 側が先に列を書いていても、見出しの中身で比べる）
@@ -808,6 +881,11 @@ function isMine_(row) {
 
 function isMuted_(row) {
   return row.mute === true || String(row.mute).toUpperCase() === 'TRUE';
+}
+
+/** 通知への番号のリアクションで閉じた件。閉じた後にスレッドの内容が変わったら閉じていない扱いに戻る。 */
+function isClosed_(row) {
+  return Boolean(row.closed_fp) && String(row.closed_fp) === String(row.fingerprint);
 }
 
 function isWeekday_(date) {
