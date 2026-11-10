@@ -75,5 +75,8 @@ assert.strictEqual(call('github_issue', { repo: 'acme/app', number: 1 }).content
 // 知らないメソッドとツール
 assert.strictEqual(handle({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'shell', arguments: {} } }).error.code, -32602);
 assert.strictEqual(handle({ jsonrpc: '2.0', method: 'notifications/initialized' }), null);
+assert.strictEqual(handle({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'constructor', arguments: {} } }).error.code, -32602);
+assert.strictEqual(handle(null), null);
+assert.strictEqual(handle(42), null);
 
 console.log('OK');

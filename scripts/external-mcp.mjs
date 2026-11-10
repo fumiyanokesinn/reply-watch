@@ -308,6 +308,7 @@ export const TOOL_NAMES = Object.keys(TOOLS);
 
 /** JSON-RPC の 1 メッセージを処理し、返すメッセージ（通知なら null）を返す。 */
 export function handle(msg) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return null; // 形の違うメッセージは無視する（サーバーを落とさない）
   const reply = (result) => ({ jsonrpc: '2.0', id: msg.id, result });
   switch (msg.method) {
     case 'initialize':
@@ -319,7 +320,8 @@ export function handle(msg) {
     case 'tools/list':
       return reply({ tools: Object.entries(TOOLS).map(([name, t]) => ({ name, description: t.description, inputSchema: t.inputSchema })) });
     case 'tools/call': {
-      const tool = TOOLS[msg.params && msg.params.name];
+      const name = msg.params && msg.params.name;
+      const tool = typeof name === 'string' && Object.hasOwn(TOOLS, name) ? TOOLS[name] : null;
       if (!tool) return { jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'unknown tool' } };
       try {
         let text = JSON.stringify(tool.run(msg.params.arguments || {}));
