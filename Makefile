@@ -5,7 +5,7 @@ test:
 
 # ローカル → GAS（テストが通った時だけ）
 push: test
-	clasp push
+	clasp push --force
 
 # GAS → ローカル（エディタで直接直した時）
 pull:

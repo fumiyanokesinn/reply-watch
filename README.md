@@ -34,19 +34,22 @@ Slack の未返信・対応未完了を AI が仕分けてスプレッドシー�
 |---|---|---|
 | GAS のコード・設定値（`CFG`）・トリガー定義 | `src/` | `make push` / `make pull`（clasp） |
 | Slack アプリの設定（スコープ等） | `slack/manifest.json` | `make slack-push` / `make slack-pull` |
-| トークン・API キー | GAS のスクリプトプロパティ | 手で登録（リポジトリには置かない） |
+| GAS プロジェクトの ID | `.clasp.json`（git 管理外） | — |
+| トークン・API キー・チャンネル ID | GAS のスクリプトプロパティ | 手で登録（リポジトリには置かない） |
 | 判定結果 | スプレッドシート | — |
 
 ## 初回セットアップ
 
 1. Slack アプリを作る: https://api.slack.com/apps → Create New App → From a manifest に `slack/manifest.json` を貼る → ワークスペースにインストール
-2. 通知先チャンネルに bot を招待し、チャンネル ID を `src/Code.gs` の `CFG.NOTIFY_CHANNEL_ID` に書く
+2. 通知先チャンネルを用意して bot を招待する
 3. `clasp show-authorized-user` で Google アカウントを確かめてから `make gas-create`（スプレッドシートと GAS プロジェクトができ、`.clasp.json` が作られる）
 4. `make push` → `make open`
 5. GAS エディタの「プロジェクトの設定 → スクリプト プロパティ」に登録
    - `SLACK_USER_TOKEN`（xoxp-…）
    - `SLACK_BOT_TOKEN`（xoxb-…）
    - `ANTHROPIC_API_KEY`
+   - `NOTIFY_CHANNEL_ID`（通知先チャンネル ID）
+   - `IGNORE_CHANNEL_IDS`（任意。監視対象外にするチャンネル ID をカンマ区切りで）
 6. エディタで `checkSetup` → `scanAndJudge` を手動実行し、実行ログの検索件数とシートの判定を確かめる
 7. 問題なければ `installTriggers` を実行
 

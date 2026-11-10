@@ -4,8 +4,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+set +x # bash -x で実行されてもトークンをトレースに出さない
 eval "$(get-credentials slack-reply-watch)"
 APP_ID=$ADMIN_USER
+case "$ADMIN_PASSWORD" in
+  *[[:space:]\"\\]*)
+    echo "トークンに使えない文字が含まれている" >&2
+    exit 1
+    ;;
+esac
 
 # トークンをコマンド引数に出さないよう、ヘッダは標準入力の設定として渡す
 call() {
