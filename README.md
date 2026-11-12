@@ -26,7 +26,7 @@ GAS  notifyStale（30 分毎）/ morningDigest（毎朝）  結果を取り込�
 
 ## 仕分けと優先度
 
-対象は、自分宛メンション・所属グループ宛メンション・自分が発言したスレッド。ただし次は対象外にしている。
+対象は、自分宛メンション・所属グループ宛メンション・全体宛（`@channel` / `@here` / `@everyone`）・自分が発言したスレッド。全体宛は、自分が参加しているチャンネル（public / private。`users.conversations` で取り、数時間キャッシュする）の投稿だけを拾う。拾っても、残すのは全員がそれぞれ行う依頼（設定・提出・回答・記入・リアクションなど）だけ。「対応できる方いますか」のように誰か 1 人が応えれば足りる呼びかけや、周知・告知は、他の人が対応していれば対応不要にする。各自が行う依頼は他の人が対応・リアクションしていても自分の分が残り、依頼が求めた完了の合図（親の投稿への `:done:` など）を自分が付けると完了になる。bot・ワークフローの投稿だけの全体宛は対象外。参加チャンネルの一覧が取れない時（スコープ不足など）は、全体宛だけ拾わない。ただし次は対象外にしている。
 
 - 本人が PR のレビューを頼まれている件（`CFG.EXCLUDE_PR_REVIEW`）。別のアラートで扱う。本人が他の人にレビューを頼んで催促する側の件は、相手待ちとして通知する
 - スクリプトプロパティ `EXCLUDE_BOT_IDS`（任意、カンマ区切り）の bot が始めたスレッド。GitHub のレビューリマインダーなど。値は bot ID（B…）か bot のユーザー ID（U…）。U… は bot の投稿にだけ当てる（人の ID を書いても、その人のスレッドは除外しない）。見るのはスレッドの最初の発言だけなので、その bot の投稿のスレッドに人が書いた依頼も対象外になる。設定を変えた後は、GAS の `scan` が一度動くまで、既に積まれた判定待ちは Mac 側で判定されることがある
@@ -74,7 +74,7 @@ DM（グループ DM 含む）は今は対象外にしている（`src/Code.gs` 
 3. `clasp show-authorized-user` で Google アカウントを確かめてから `make gas-create`（スプレッドシートと GAS プロジェクトができ、`.clasp.json` が作られる）
 4. `make push` → `make open`
 5. GAS エディタの「プロジェクトの設定 → スクリプト プロパティ」に登録
-   - `SLACK_USER_TOKEN`（xoxp-…）
+   - `SLACK_USER_TOKEN`（xoxp-…。スコープは `slack/manifest.json` の user スコープ。全体宛の絞り込みに `channels:read` / `groups:read` を使う）
    - `SLACK_BOT_TOKEN`（xoxb-…）
    - `NOTIFY_CHANNEL_ID`（通知先チャンネル ID）
    - `IGNORE_CHANNEL_IDS`（任意。監視対象外にするチャンネル ID をカンマ区切りで）
@@ -102,7 +102,7 @@ Slack の App Configuration Token（12 時間で失効）を使う。使う時�
 3. アプリを作った直後に一度 `make slack-pull`（Slack が補った項目を取り込む。`slack-push` は設定全体を置き換えるため）
 4. 以降は `slack/manifest.json` を直して `make slack-validate` → `make slack-push`
 
-スコープを変えた時は Slack 側でアプリの再インストールが要る。
+スコープを変えた時（例: 全体宛の絞り込みで足した `channels:read` / `groups:read`）は、`make slack-push` のあと、Slack 側でアプリを再インストールして、新しいトークンを `SLACK_USER_TOKEN` に登録し直す。再インストールするまでは参加チャンネルが取れず、全体宛だけ拾わない（実行ログに「参加チャンネル取得失敗」が出る）。
 
 ## 運用
 

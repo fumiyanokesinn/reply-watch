@@ -267,7 +267,7 @@ function done(name) {
 const PR_TO_ME = 'REVIEW_TO_ME';
 const PR_OTHER = 'OTHER';
 // judgments の 10 列目。判定の版（GAS の CFG.JUDGE_VERSION と揃える。prompts/judge.md の基準を変えたら上げる）
-export const JUDGE_VERSION = 5;
+export const JUDGE_VERSION = 6;
 
 /**
  * 今の版の判定の「key|fingerprint」ごとの判定時刻（ミリ秒）の一覧。9 列目が今の版の値でない判定（古い版）は数えない

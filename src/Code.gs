@@ -8,7 +8,7 @@
  *   GAS    notifyStale() / morningDigest()  判定結果を取り込み、優先度を付けて bot で投稿する
  *
  * 設定は下の CFG（リポジトリで管理）。秘密の値と公開したくない ID はスクリプトプロパティに置く:
- *   SLACK_USER_TOKEN   xoxp-…  読み取り用（search:read, *:history, usergroups:read）
+ *   SLACK_USER_TOKEN   xoxp-…  読み取り用（search:read, *:history, usergroups:read, channels:read, groups:read。後ろ 2 つは全体宛の絞り込みで参加チャンネルを読む）
  *   SLACK_BOT_TOKEN    xoxb-…  通知投稿用（chat:write）。本人名義で投稿すると通知が鳴らないため bot で投稿する
  *   NOTIFY_CHANNEL_ID  通知先チャンネル ID（bot を招待しておく）
  *   IGNORE_CHANNEL_IDS 任意。監視対象外にするチャンネル ID（カンマ区切り）
@@ -20,7 +20,7 @@ const CFG = {
   EXCLUDE_PR_REVIEW: true,
   // 判定の版。prompts/judge.md の基準を変えたら上げる（scripts/local-ai.mjs の JUDGE_VERSION と揃える）。
   // 版の違う判定は取り込まず、対応が残っている件は判定し直す
-  JUDGE_VERSION: 5,
+  JUDGE_VERSION: 6,
   REVERIFY_HOURS: 24, // 対応が残っている件は、判定からこの時間が経つと Slack を調べ直す（scripts/local-ai.mjs と揃える）
   INCLUDE_DM: false, // DM（グループ DM 含む）を対象にするか。false の間は拾わず、既にある DM の件も追跡・通知しない
   DONE_REACTIONS: ['done', 'white_check_mark'], // 本人が付けたら対応完了として扱うリアクション
@@ -47,6 +47,8 @@ const CFG = {
   MAX_INPUT_CHARS: 40000, // 判定待ちとして 1 セルに積む JSON の上限（セルの上限は 5 万字）
   TIME_BUDGET_MS: 4.5 * 60 * 1000, // GAS の 6 分制限に対する打ち切り時間
   SLACK_INTERVAL_MS: 1200, // history 系 API の呼び出し間隔（Tier 3 = 50回/分）
+  CHANNELS_CACHE_SECONDS: 6 * 3600, // 参加チャンネル一覧をキャッシュする時間（CacheService の上限は 6 時間）
+  CHANNELS_CACHE_CHUNK: 3000, // キャッシュ 1 キーに入れる ID の数（1 キー 100KB の上限に余裕を持たせる）
   SHEET_NAME: 'threads',
   JUDGMENTS_SHEET: 'judgments', // Mac 側だけが追記する
   NOTICES_SHEET: 'notices', // Mac 側だけが追記する
@@ -220,7 +222,66 @@ function myGroups_(me) {
   }
 }
 
-/** search.messages で「自分宛・所属グループ宛メンション / DM / 自分の発言」を含むスレッドを集める。 */
+/**
+ * 本人が参加しているチャンネルの ID（public / private）。全体宛（@channel など）の絞り込みに使う。
+ * CacheService に ID をカンマ区切りで、CFG.CHANNELS_CACHE_CHUNK 個ずつ分けて持つ（1 キー 100KB の上限対策）。
+ * 取得できなければ null（スコープ不足の missing_scope を含む）。呼び出し側は全体宛の経路だけを止める。
+ */
+function myChannelIds_() {
+  const cache = cacheService_();
+  try {
+    const n = cache && Number(cache.get('my_channels_n'));
+    if (n > 0) {
+      const parts = [];
+      for (let i = 0; i < n; i++) {
+        const part = cache.get(`my_channels_${i}`);
+        if (part === null || part === undefined) { parts.length = 0; break; }
+        parts.push(part);
+      }
+      if (parts.length === n) return new Set(parts.join(',').split(',').filter(String));
+    }
+  } catch (e) {
+    console.warn(`参加チャンネルのキャッシュ読み取り失敗、取り直す: ${e.message}`);
+  }
+  const ids = [];
+  try {
+    let cursor = '';
+    for (let page = 0; page < 50; page++) {
+      if (page) Utilities.sleep(CFG.SLACK_INTERVAL_MS);
+      const params = { types: 'public_channel,private_channel', exclude_archived: true, limit: 200 };
+      if (cursor) params.cursor = cursor;
+      const res = slack_('users.conversations', params);
+      (res.channels || []).forEach((c) => c && c.id && ids.push(c.id));
+      cursor = (res.response_metadata && res.response_metadata.next_cursor) || '';
+      if (!cursor) break;
+    }
+  } catch (e) {
+    console.warn(`参加チャンネル取得失敗、全体宛は拾わない: ${e.message}`);
+    return null;
+  }
+  try {
+    if (cache) {
+      const chunks = [];
+      for (let i = 0; i < ids.length; i += CFG.CHANNELS_CACHE_CHUNK) chunks.push(ids.slice(i, i + CFG.CHANNELS_CACHE_CHUNK).join(','));
+      // 先に本体、最後に個数を書く（途中で失敗しても、個数が無ければ読まれない）
+      chunks.forEach((c, i) => cache.put(`my_channels_${i}`, c, CFG.CHANNELS_CACHE_SECONDS));
+      cache.put('my_channels_n', String(chunks.length), CFG.CHANNELS_CACHE_SECONDS);
+    }
+  } catch (e) {
+    console.warn(`参加チャンネルのキャッシュ書き込み失敗: ${e.message}`);
+  }
+  return new Set(ids);
+}
+
+function cacheService_() {
+  try {
+    return CacheService.getScriptCache();
+  } catch (e) {
+    return null;
+  }
+}
+
+/** search.messages で「自分宛・所属グループ宛・全体宛メンション / DM / 自分の発言」を含むスレッドを集める。 */
 function collectCandidates_(me, groups, dmFlags, timeUp) {
   const after = Utilities.formatDate(
     new Date(Date.now() - (CFG.LOOKBACK_DAYS + 1) * 864e5), CFG.TZ, 'yyyy-MM-dd');
@@ -229,10 +290,18 @@ function collectCandidates_(me, groups, dmFlags, timeUp) {
     { label: '自分宛メンション', q: `<@${me}> after:${after}` },
   ].concat(CFG.INCLUDE_DM ? [{ label: 'DM', q: `is:dm after:${after}` }] : []).concat([
     { label: '自分の発言', q: `from:<@${me}> after:${after}` },
-  ]).concat(groups.map((g, i) => ({ label: `グループ宛${i + 1}`, q: `<!subteam^${g.id}> after:${after}` })));
+  ]).concat(groups.map((g, i) => ({ label: `グループ宛${i + 1}`, q: `<!subteam^${g.id}> after:${after}` })))
+    // 全体宛は最後（時間切れの時は既存の経路を優先）。本人が参加しているチャンネルの投稿だけを拾う
+    .concat(['channel', 'here', 'everyone'].map((w) => ({ label: `全体宛(${w})`, q: `<!${w}> after:${after}`, broadcast: true })));
   const ignored = ignoredChannels_();
   const cands = new Map();
-  for (const { label, q: query } of queries) {
+  let joined; // undefined = まだ取っていない、null = 取得失敗（全体宛の経路は止める）
+  for (const { label, q: query, broadcast } of queries) {
+    if (broadcast) {
+      if (timeUp && timeUp()) break;
+      if (joined === undefined) joined = myChannelIds_();
+      if (!joined) break;
+    }
     let count = 0;
     for (let page = 1; page <= 5; page++) {
       if (timeUp && timeUp()) break; // 残りは次回（取得の時間を残す）
@@ -244,6 +313,7 @@ function collectCandidates_(me, groups, dmFlags, timeUp) {
       for (const m of matches) {
         const ch = m.channel || {};
         if (!ch.id || ignored.has(ch.id)) continue;
+        if (broadcast && !joined.has(ch.id)) continue;
         const threadTs = (/[?&]thread_ts=([\d.]+)/.exec(m.permalink || '') || [])[1];
         const isDm = Boolean(ch.is_im || ch.is_mpim || ch.id.charAt(0) === 'D');
         const key = isDm && !threadTs ? `${ch.id}:dm` : `${ch.id}:${threadTs || m.ts}`;

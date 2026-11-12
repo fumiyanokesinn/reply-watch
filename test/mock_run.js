@@ -44,6 +44,13 @@ const calls = { replies: 0, external: [], queries: [] };
 const extraMentions = [];
 const notifyHistory = [];
 const threadPosts = []; // 通知先チャンネルの投稿（新しい順）
+// 全体宛（@channel / @here / @everyone）の検索結果。語ごとに { c: チャンネル, t: ts, root: スレッドの親 } を入れる
+const broadcast = { channel: [], here: [], everyone: [] };
+// 本人が参加しているチャンネル（users.conversations）。失敗させる時は usersConvError にエラー名を入れる
+let joinedChannels = ['C1', 'C2', 'C3', 'C4', 'C5', 'CIGN'];
+let usersConvError = '';
+const convPages = []; // users.conversations の呼び出しの引数
+const cacheStore = new Map(); // CacheService のスタブ
 
 const response = (code, body) => ({
   getResponseCode: () => code, getContentText: () => JSON.stringify(body), getHeaders: () => ({}),
@@ -58,6 +65,16 @@ function slack(url, req) {
   if (method === 'usergroups.list') {
     return response(200, { ok: true, usergroups: [{ id: 'SG1', handle: 'server', users: [ME] }, { id: 'SG2', handle: 'other', users: ['UX'] }] });
   }
+  if (method === 'users.conversations') {
+    convPages.push(q);
+    assert.strictEqual(q.types, 'public_channel,private_channel');
+    assert.strictEqual(q.exclude_archived, 'true');
+    assert.strictEqual(q.limit, '200');
+    if (usersConvError) return response(200, { ok: false, error: usersConvError });
+    const from = Number(q.cursor || 0);
+    const next = from + 2 < joinedChannels.length ? String(from + 2) : ''; // 2 件ずつ返してページ送りを試す
+    return response(200, { ok: true, channels: joinedChannels.slice(from, from + 2).map((id) => ({ id })), response_metadata: { next_cursor: next } });
+  }
   if (method === 'search.messages') {
     calls.queries.push(q.query);
     let matches = [];
@@ -71,6 +88,9 @@ function slack(url, req) {
       ].concat(extraMentions);
     } else if (q.query.startsWith('<!subteam^SG1>')) {
       matches = [{ channel: { id: 'C4' }, ts: T.group, permalink: link('C4', T.group) }];
+    } else if (/^<!(channel|here|everyone)>/.test(q.query)) {
+      const word = /^<!(\w+)>/.exec(q.query)[1];
+      matches = broadcast[word].map((b) => ({ channel: { id: b.c }, ts: b.t, permalink: link(b.c, b.t, b.root) }));
     } else if (q.query.startsWith('<!subteam')) {
       throw new Error('所属していないグループを検索した');
     } else if (q.query.startsWith('is:dm')) {
@@ -145,6 +165,10 @@ const sandbox = {
     },
   },
   ScriptApp: {},
+  CacheService: { getScriptCache: () => ({
+    get: (k) => (cacheStore.has(k) ? cacheStore.get(k) : null),
+    put: (k, v) => { assert.ok(Buffer.byteLength(v) <= 100 * 1024); cacheStore.set(k, v); },
+  }) },
 };
 vm.createContext(sandbox);
 vm.runInContext(`const RealDate = Date; Date = class extends RealDate {
@@ -154,6 +178,7 @@ vm.runInContext(`const RealDate = Date; Date = class extends RealDate {
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/Code.gs'), 'utf8') +
   '\nthis.__api = { scan, notify_, COLS, STATE, CFG, parseDue_, isDueForStale_, isActive_, isRipe_, isMine_, isClosed_, closeNumbers_, elapsedHours_, priority_, cell_, cleanLine_, link_, renderMessages_, fitInput_ };', sandbox);
 const api = sandbox.__api;
+const JV = api.CFG.JUDGE_VERSION; // 現行の判定の版
 const { scan, notify_, COLS, STATE } = api;
 api.CFG.INCLUDE_DM = true; // DM を含めた流れを先に確かめ、最後に外した場合を確かめる
 const table = () => Object.fromEntries(grids.threads.slice(1).map((r) => [r[0], Object.fromEntries(COLS.map((c, i) => [c, r[i]]))]));
@@ -178,7 +203,7 @@ function localJudge() {
     const due = new Date(FIXED + 19 * 36e5).toISOString().slice(0, 16).replace('T', ' ');
     const next = state === 'UNREPLIED' || state === 'PROMISED' ? '返信する' : '';
     const pr = text.includes('PR #77') ? 'REVIEW_TO_ME' : 'OTHER';
-    grids.judgments.push([r.key, r.pending_fp, state, `要約(${state})`, '根拠', next, state === 'PROMISED' ? due : '', JNOW, pr, 5, '', '確認で書いたボール', 'NOT_STARTED']);
+    grids.judgments.push([r.key, r.pending_fp, state, `要約(${state})`, '根拠', next, state === 'PROMISED' ? due : '', JNOW, pr, JV, '', '確認で書いたボール', 'NOT_STARTED']);
     n++;
   });
   return n;
@@ -347,8 +372,8 @@ assert.strictEqual(table()[`C3:${T.waitRoot}`].state, STATE.WAITING_OTHERS);
 threads[`C2:${T.doneRoot}`].push({ user: 'UC', text: '再依頼: 別の URL もください', ts: T.more });
 extraMentions.push({ channel: { id: 'C2' }, ts: T.more, permalink: `https://x.slack.com/archives/C2/p1?thread_ts=${T.doneRoot}` });
 scan();
-grids.judgments.push([`C2:${T.doneRoot}`, '古い内容の指紋', 'NO_ACTION', 'x', 'x', '', '', JNOW, 'OTHER', 5]);
-grids.judgments.push([`C2:${T.doneRoot}`, table()[`C2:${T.doneRoot}`].pending_fp, 'BOGUS', 'x', 'x', '', '', JNOW, 'OTHER', 5]);
+grids.judgments.push([`C2:${T.doneRoot}`, '古い内容の指紋', 'NO_ACTION', 'x', 'x', '', '', JNOW, 'OTHER', JV]);
+grids.judgments.push([`C2:${T.doneRoot}`, table()[`C2:${T.doneRoot}`].pending_fp, 'BOGUS', 'x', 'x', '', '', JNOW, 'OTHER', JV]);
 scan();
 assert.strictEqual(table()[`C2:${T.doneRoot}`].state, STATE.DONE);
 assert.ok(table()[`C2:${T.doneRoot}`].pending_fp);
@@ -418,7 +443,7 @@ grids.judgments.push([prKey, table()[prKey].pending_fp, 'DONE', 'x', 'x', '', ''
 scan();
 assert.ok(table()[prKey].pending_fp);
 threads[prKey][0].text += ' PR #77 のレビューお願いします';
-grids.judgments.push([prKey, table()[prKey].pending_fp, 'PROMISED', 'PR のレビュー', 'r', '見る', '', JNOW, 'REVIEW_TO_ME', 5]);
+grids.judgments.push([prKey, table()[prKey].pending_fp, 'PROMISED', 'PR のレビュー', 'r', '見る', '', JNOW, 'REVIEW_TO_ME', JV]);
 scan();
 t = table();
 assert.strictEqual(t[prKey].pending_fp, '');
@@ -429,17 +454,17 @@ assert.ok(!posted.at(-1).text.includes('PR のレビュー'));
 
 // 12b) 判定の版が上がると、対応が残っている件は内容が同じでも判定し直し、版の違う判定は取り込まない
 const vKey = `C4:${T.group}`;
-assert.strictEqual(String(table()[vKey].judge_version), '5');
-api.CFG.JUDGE_VERSION = 6;
+assert.strictEqual(String(table()[vKey].judge_version), String(JV));
+api.CFG.JUDGE_VERSION = JV + 1;
 scan();
 assert.ok(table()[vKey].pending_fp, '版が上がると判定し直しに回る');
-grids.judgments.push([vKey, table()[vKey].pending_fp, 'NO_ACTION', 'x', 'x', '', '', JNOW, 'OTHER', 5]);
+grids.judgments.push([vKey, table()[vKey].pending_fp, 'NO_ACTION', 'x', 'x', '', '', JNOW, 'OTHER', JV]);
 scan();
 assert.strictEqual(table()[vKey].state, STATE.UNREPLIED, '古い版の判定は取り込まない');
-grids.judgments.push([vKey, table()[vKey].pending_fp, 'NO_ACTION', '他の人が対応済み', 'x', '', '', JNOW, 'OTHER', 6]);
+grids.judgments.push([vKey, table()[vKey].pending_fp, 'NO_ACTION', '他の人が対応済み', 'x', '', '', JNOW, 'OTHER', JV + 1]);
 scan();
 assert.strictEqual(table()[vKey].state, STATE.NO_ACTION);
-api.CFG.JUDGE_VERSION = 5;
+api.CFG.JUDGE_VERSION = JV;
 
 // 12c) 対応が残っている件は、判定から REVERIFY_HOURS 経つと同じ内容でも判定し直しに回る。
 //      判定し直しに回す前の判定は取り込まず、その後の判定だけを取り込む
@@ -454,10 +479,10 @@ grids.judgments.forEach((r) => { if (r[0] === rKey) r[7] = new Date(FIXED + 9 * 
 scan();
 assert.ok(table()[rKey].pending_fp, '24 時間を過ぎた判定は調べ直しに回る');
 grids.judgments.push([rKey, table()[rKey].pending_fp, 'DONE', 'x', 'x', '', '',
-  new Date(FIXED + 9 * 36e5 - 60 * 1000).toISOString().slice(0, 19).replace('T', ' '), 'OTHER', 5]);
+  new Date(FIXED + 9 * 36e5 - 60 * 1000).toISOString().slice(0, 19).replace('T', ' '), 'OTHER', JV]);
 scan();
 assert.ok(table()[rKey].pending_fp, '回す前の判定は取り込まない');
-grids.judgments.push([rKey, table()[rKey].pending_fp, 'DONE', '別スレで解決済み', 'x', '', '', JNOW, 'OTHER', 5, '11/09 に別スレで合意']);
+grids.judgments.push([rKey, table()[rKey].pending_fp, 'DONE', '別スレで解決済み', 'x', '', '', JNOW, 'OTHER', JV, '11/09 に別スレで合意']);
 scan();
 assert.strictEqual(table()[rKey].state, STATE.DONE);
 assert.strictEqual(table()[rKey].verify_note, '11/09 に別スレで合意');
@@ -567,6 +592,78 @@ assert.notStrictEqual(api.priority_(normal, FIXED), '対象外');
 assert.ok(api.isActive_(normal, FIXED));
 api.CFG.INCLUDE_DM = true;
 assert.ok(api.isActive_(dmRows[0], FIXED));
+
+// 15) 全体宛（@channel / @here / @everyone）: 参加チャンネルの投稿だけを拾い、検索の最後に回す。
+//     users.conversations が失敗（missing_scope など）したら全体宛の経路だけを止め、他の経路は続ける。
+{
+  const wide = (n) => ts(3, n);
+  const wideKey = (c, n) => `${c}:${wide(n)}`;
+  const human = (n, text) => [{ user: 'UA', text, ts: wide(n), reply_count: 1 }, { user: 'UB', text: '設定しました', ts: ts(2.5, n) }];
+  threads[wideKey('C5', 1)] = human(1, '<!channel> 全員 2 段階認証を設定してください。期限 11/20。完了したら :done: を');
+  threads[wideKey('C5', 2)] = [{ bot_id: 'B1', username: 'wf', text: '<!here> 今週の周知', ts: wide(2) }]; // bot だけ
+  threads[wideKey('CX', 3)] = human(3, '<!channel> 参加していないチャンネルの依頼');
+  threads[wideKey('CIGN', 4)] = human(4, '<!everyone> 除外チャンネルの依頼');
+  broadcast.channel.push({ c: 'C5', t: wide(1) }, { c: 'CX', t: wide(3) });
+  broadcast.here.push({ c: 'C5', t: wide(2) });
+  broadcast.everyone.push({ c: 'CIGN', t: wide(4) });
+  props.IGNORE_CHANNEL_IDS = 'CIGN';
+  cacheStore.clear();
+  convPages.length = 0;
+  api.CFG.CHANNELS_CACHE_CHUNK = 2; // 分割して持つ場合も確かめる
+  calls.queries = [];
+  scan();
+  t = table();
+  // 参加チャンネルの全体宛は判定待ちに積まれる（本文に <!channel> が入る）
+  assert.ok(t[wideKey('C5', 1)].pending_fp);
+  assert.ok(JSON.parse(t[wideKey('C5', 1)].pending_input).messages[0].text.includes('<!channel>'));
+  // bot だけの全体投稿は AI に回さず対応不要
+  assert.strictEqual(t[wideKey('C5', 2)].state, STATE.NO_ACTION);
+  assert.strictEqual(t[wideKey('C5', 2)].pending_fp, '');
+  // 参加していない・IGNORE_CHANNEL_IDS のチャンネルは候補にならない
+  assert.ok(!t[wideKey('CX', 3)] && !t[wideKey('CIGN', 4)]);
+  // 全体宛の検索は最後（既存の経路の後）にこの順で行う。所属していないグループや is:dm の扱いは変わらない
+  const qs = calls.queries;
+  assert.deepStrictEqual(qs.slice(-3).map((q) => q.split(' ')[0]), ['<!channel>', '<!here>', '<!everyone>']);
+  assert.ok(qs.slice(0, -3).every((q) => !/^<!(channel|here|everyone)>/.test(q)));
+  assert.ok(qs.every((q) => !q.startsWith('<!subteam^SG2')));
+  // 参加チャンネルは 3 ページ（next_cursor）で取り、キャッシュに分けて持つ。2 回目の scan は取り直さない
+  assert.strictEqual(convPages.length, 3);
+  assert.deepStrictEqual([...cacheStore.keys()].sort(), ['my_channels_0', 'my_channels_1', 'my_channels_2', 'my_channels_n']);
+  assert.strictEqual(cacheStore.get('my_channels_n'), '3');
+  scan();
+  assert.strictEqual(convPages.length, 3);
+
+  // users.conversations の失敗（missing_scope）: 全体宛の経路だけが止まり、既存の経路は続く。失敗はキャッシュしない
+  cacheStore.clear();
+  usersConvError = 'missing_scope';
+  const lateKey = wideKey('C1', 6);
+  threads[lateKey] = [{ user: 'UA', text: `<@${ME}> 追加の依頼です`, ts: wide(6) }];
+  extraMentions.push({ channel: { id: 'C1' }, ts: wide(6), permalink: `https://x.slack.com/archives/C1/p6` });
+  threads[wideKey('C5', 7)] = human(7, '<!channel> 失敗中に増えた全体宛');
+  broadcast.channel.push({ c: 'C5', t: wide(7) });
+  calls.queries = [];
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (m) => warns.push(String(m));
+  try {
+    scan();
+  } finally {
+    console.warn = origWarn;
+  }
+  t = table();
+  assert.ok(t[lateKey], '既存の経路は続く');
+  assert.ok(!t[wideKey('C5', 7)], '全体宛は拾わない');
+  assert.ok(calls.queries.length > 0 && calls.queries.every((q) => !/^<!(channel|here|everyone)>/.test(q)));
+  assert.ok(warns.some((w) => w.includes('参加チャンネル取得失敗') && w.includes('missing_scope')), warns.join('\n'));
+  assert.strictEqual(cacheStore.size, 0);
+
+  // 回復したら、次の scan で全体宛も拾う
+  usersConvError = '';
+  scan();
+  assert.ok(table()[wideKey('C5', 7)]);
+  api.CFG.CHANNELS_CACHE_CHUNK = 3000;
+  delete props.IGNORE_CHANNEL_IDS;
+}
 
 console.log('OK');
 console.log(posted.map((p) => p.text).join('\n---\n'));

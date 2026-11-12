@@ -17,7 +17,9 @@
         "groups:history",
         "im:history",
         "mpim:history",
-        "usergroups:read"
+        "usergroups:read",
+        "channels:read",
+        "groups:read"
       ],
       "bot": [
         "chat:write"
