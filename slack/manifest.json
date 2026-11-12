@@ -1,7 +1,8 @@
 {
   "display_information": {
-    "name": "reply-watch",
-    "description": "未返信・対応未完了のリマインド"
+    "name": "新通の通知Bot",
+    "description": "未返信・対応未完了のリマインド",
+    "background_color": "#181B24"
   },
   "features": {
     "bot_user": {
@@ -24,11 +25,14 @@
       "bot": [
         "chat:write"
       ]
-    }
+    },
+    "pkce_enabled": false
   },
   "settings": {
     "org_deploy_enabled": false,
     "socket_mode_enabled": false,
-    "token_rotation_enabled": false
+    "is_mcp_enabled": false,
+    "token_rotation_enabled": false,
+    "app_level_token_rotation_enabled": false
   }
 }
