@@ -225,9 +225,10 @@ function myGroups_(me) {
 /**
  * 本人が参加しているチャンネルの ID（public / private）。全体宛（@channel など）の絞り込みに使う。
  * CacheService に ID をカンマ区切りで、CFG.CHANNELS_CACHE_CHUNK 個ずつ分けて持つ（1 キー 100KB の上限対策）。
- * 取得できなければ null（スコープ不足の missing_scope を含む）。呼び出し側は全体宛の経路だけを止める。
+ * 取得できなければ null（スコープ不足の missing_scope を含む）。ページ送りの途中で時間切れになった時も null（途中までの一覧は使わず、キャッシュもしない）。
+ * 呼び出し側は全体宛の経路だけを止める。
  */
-function myChannelIds_() {
+function myChannelIds_(timeUp) {
   const cache = cacheService_();
   try {
     const n = cache && Number(cache.get('my_channels_n'));
@@ -247,7 +248,13 @@ function myChannelIds_() {
   try {
     let cursor = '';
     for (let page = 0; page < 50; page++) {
-      if (page) Utilities.sleep(CFG.SLACK_INTERVAL_MS);
+      if (page) {
+        if (timeUp && timeUp()) {
+          console.warn('参加チャンネル取得が時間切れ、全体宛は次回に回す');
+          return null;
+        }
+        Utilities.sleep(CFG.SLACK_INTERVAL_MS);
+      }
       const params = { types: 'public_channel,private_channel', exclude_archived: true, limit: 200 };
       if (cursor) params.cursor = cursor;
       const res = slack_('users.conversations', params);
@@ -263,7 +270,8 @@ function myChannelIds_() {
     if (cache) {
       const chunks = [];
       for (let i = 0; i < ids.length; i += CFG.CHANNELS_CACHE_CHUNK) chunks.push(ids.slice(i, i + CFG.CHANNELS_CACHE_CHUNK).join(','));
-      // 先に本体、最後に個数を書く（途中で失敗しても、個数が無ければ読まれない）
+      // 前回の個数を先に消し、本体、最後に個数の順に書く。途中で失敗しても個数が無ければ読まれず、古い個数で新旧の chunk が混ざらない
+      cache.remove('my_channels_n');
       chunks.forEach((c, i) => cache.put(`my_channels_${i}`, c, CFG.CHANNELS_CACHE_SECONDS));
       cache.put('my_channels_n', String(chunks.length), CFG.CHANNELS_CACHE_SECONDS);
     }
@@ -299,10 +307,12 @@ function collectCandidates_(me, groups, dmFlags, timeUp) {
   for (const { label, q: query, broadcast } of queries) {
     if (broadcast) {
       if (timeUp && timeUp()) break;
-      if (joined === undefined) joined = myChannelIds_();
+      if (joined === undefined) joined = myChannelIds_(timeUp);
       if (!joined) break;
     }
     let count = 0;
+    let kept = 0; // 全体宛: 参加チャンネルで絞った後に残った件数
+    let capped = false; // 5 ページ読んでも続きがある
     for (let page = 1; page <= 5; page++) {
       if (timeUp && timeUp()) break; // 残りは次回（取得の時間を残す）
       const res = slack_('search.messages', {
@@ -314,6 +324,7 @@ function collectCandidates_(me, groups, dmFlags, timeUp) {
         const ch = m.channel || {};
         if (!ch.id || ignored.has(ch.id)) continue;
         if (broadcast && !joined.has(ch.id)) continue;
+        kept++;
         const threadTs = (/[?&]thread_ts=([\d.]+)/.exec(m.permalink || '') || [])[1];
         const isDm = Boolean(ch.is_im || ch.is_mpim || ch.id.charAt(0) === 'D');
         const key = isDm && !threadTs ? `${ch.id}:dm` : `${ch.id}:${threadTs || m.ts}`;
@@ -327,8 +338,10 @@ function collectCandidates_(me, groups, dmFlags, timeUp) {
       }
       const paging = (res.messages && res.messages.paging) || {};
       if (!matches.length || page >= (paging.pages || 1)) break;
+      if (page === 5) capped = true;
     }
-    console.log(`検索 経路=${label} 件数=${count}`); // 0 件の経路があれば、その検索は拾えていない
+    if (broadcast && capped) console.warn(`検索 経路=${label} 全体宛の検索が上限に達した、古い分は拾えていない`);
+    console.log(`検索 経路=${label} 件数=${count}${broadcast ? ` 参加チャンネル分=${kept}` : ''}`); // 0 件の経路があれば、その検索は拾えていない
   }
   return cands;
 }

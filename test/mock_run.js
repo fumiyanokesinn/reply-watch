@@ -51,6 +51,9 @@ let joinedChannels = ['C1', 'C2', 'C3', 'C4', 'C5', 'CIGN'];
 let usersConvError = '';
 const convPages = []; // users.conversations の呼び出しの引数
 const cacheStore = new Map(); // CacheService のスタブ
+let cachePutFail = ''; // この名前のキーへの put を失敗させる
+let capQuery = ''; // この語で始まる検索は、続きのページがいつまでもある状態にする
+let onConvPage = null; // users.conversations の呼び出しごとに呼ぶ（時間切れの再現用）
 
 const response = (code, body) => ({
   getResponseCode: () => code, getContentText: () => JSON.stringify(body), getHeaders: () => ({}),
@@ -67,6 +70,7 @@ function slack(url, req) {
   }
   if (method === 'users.conversations') {
     convPages.push(q);
+    if (onConvPage) onConvPage(q);
     assert.strictEqual(q.types, 'public_channel,private_channel');
     assert.strictEqual(q.exclude_archived, 'true');
     assert.strictEqual(q.limit, '200');
@@ -103,7 +107,7 @@ function slack(url, req) {
         { channel: { id: 'C2' }, ts: T.done, permalink: link('C2', T.done, T.doneRoot) },
       ];
     }
-    return response(200, { ok: true, messages: { matches, paging: { pages: 1 } } });
+    return response(200, { ok: true, messages: { matches, paging: { pages: capQuery && q.query.startsWith(capQuery) ? 99 : 1 } } });
   }
   if (method === 'conversations.replies') {
     calls.replies++;
@@ -167,7 +171,8 @@ const sandbox = {
   ScriptApp: {},
   CacheService: { getScriptCache: () => ({
     get: (k) => (cacheStore.has(k) ? cacheStore.get(k) : null),
-    put: (k, v) => { assert.ok(Buffer.byteLength(v) <= 100 * 1024); cacheStore.set(k, v); },
+    put: (k, v) => { if (k === cachePutFail) throw new Error('put 失敗'); assert.ok(Buffer.byteLength(v) <= 100 * 1024); cacheStore.set(k, v); },
+    remove: (k) => { cacheStore.delete(k); },
   }) },
 };
 vm.createContext(sandbox);
@@ -661,6 +666,72 @@ assert.ok(api.isActive_(dmRows[0], FIXED));
   usersConvError = '';
   scan();
   assert.ok(table()[wideKey('C5', 7)]);
+
+  // 前回の個数が残ったまま途中の put が失敗しても、新旧の chunk を混ぜた一覧は使わない（取り直す）
+  scan(); // キャッシュを作り直す（個数 3）
+  assert.strictEqual(cacheStore.get('my_channels_n'), '3');
+  cacheStore.delete('my_channels_1'); // 読み取りが失敗して取り直しに回る
+  joinedChannels = ['C1', 'C2', 'C3', 'C4', 'C5', 'CIGN', 'C6']; // 一覧が変わった（chunk は 4 になる）
+  threads[wideKey('C6', 8)] = human(8, '<!channel> 新しく参加したチャンネルの依頼');
+  broadcast.channel.push({ c: 'C6', t: wide(8) });
+  cachePutFail = 'my_channels_1';
+  convPages.length = 0;
+  const warns2 = [];
+  console.warn = (m) => warns2.push(String(m));
+  try {
+    scan();
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.ok(table()[wideKey('C6', 8)], '取り直した一覧を、その回から使う');
+  assert.ok(!cacheStore.has('my_channels_n'), '個数は消えたまま（古い個数で読まれない）');
+  assert.ok(warns2.some((w) => w.includes('キャッシュ書き込み失敗')));
+  cachePutFail = '';
+  const fetchedBefore = convPages.length;
+  scan();
+  assert.ok(convPages.length > fetchedBefore, '混ざった一覧は使わず、取り直す');
+  assert.strictEqual(cacheStore.get('my_channels_n'), '4');
+
+  // ページ送りの途中で時間切れ: 取得をやめて全体宛を拾わず、途中の一覧をキャッシュしない（失敗とは別の警告）
+  cacheStore.clear();
+  threads[wideKey('C6', 9)] = human(9, '<!channel> 時間切れの回の全体宛');
+  broadcast.channel.push({ c: 'C6', t: wide(9) });
+  onConvPage = (q) => { if (q.cursor) api.CFG.TIME_BUDGET_MS = -1; }; // 2 ページ目を読んだ後に時間切れにする
+  calls.queries = [];
+  const warns3 = [];
+  console.warn = (m) => warns3.push(String(m));
+  try {
+    scan();
+  } finally {
+    console.warn = origWarn;
+    onConvPage = null;
+    api.CFG.TIME_BUDGET_MS = 4.5 * 60 * 1000;
+  }
+  assert.ok(!table()[wideKey('C6', 9)], '時間切れの回は全体宛を拾わない');
+  assert.ok(calls.queries.every((q) => !/^<!(channel|here|everyone)>/.test(q)));
+  assert.ok(warns3.some((w) => w.includes('時間切れ') && !w.includes('取得失敗')), warns3.join('\n'));
+  assert.strictEqual(cacheStore.size, 0);
+  scan(); // 次回は取り直して拾う
+  assert.ok(table()[wideKey('C6', 9)]);
+
+  // 5 ページ読んでも続きがある全体宛は警告し、絞り込み後の件数もログに出す（上限に達していない経路は警告しない）
+  const logs = [];
+  const origLog = console.log;
+  const warns4 = [];
+  console.log = (m) => logs.push(String(m));
+  console.warn = (m) => warns4.push(String(m));
+  capQuery = '<!here>';
+  try {
+    scan();
+  } finally {
+    console.log = origLog;
+    console.warn = origWarn;
+    capQuery = '';
+  }
+  assert.ok(logs.some((l) => l === '検索 経路=全体宛(channel) 件数=5 参加チャンネル分=4'), logs.filter((l) => l.startsWith('検索')).join('\n'));
+  assert.deepStrictEqual(warns4.filter((w) => w.includes('上限')), ['検索 経路=全体宛(here) 全体宛の検索が上限に達した、古い分は拾えていない']);
+  assert.ok(logs.some((l) => l.startsWith('検索 経路=自分宛メンション 件数=') && !l.includes('参加チャンネル分')));
+
   api.CFG.CHANNELS_CACHE_CHUNK = 3000;
   delete props.IGNORE_CHANNEL_IDS;
 }
