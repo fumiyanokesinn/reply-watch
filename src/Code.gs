@@ -312,8 +312,9 @@ function collectCandidates_(me, groups, dmFlags, timeUp) {
     }
     let count = 0;
     let kept = 0; // 全体宛: 参加チャンネルで絞った後に残った件数
-    let capped = false; // 5 ページ読んでも続きがある
-    for (let page = 1; page <= 5; page++) {
+    const maxPages = 5; // 1 経路で読むページ数の上限
+    let capped = false; // 上限まで読んでも続きがある
+    for (let page = 1; page <= maxPages; page++) {
       if (timeUp && timeUp()) break; // 残りは次回（取得の時間を残す）
       const res = slack_('search.messages', {
         query: query, count: 100, page: page, sort: 'timestamp', sort_dir: 'desc',
@@ -338,7 +339,7 @@ function collectCandidates_(me, groups, dmFlags, timeUp) {
       }
       const paging = (res.messages && res.messages.paging) || {};
       if (!matches.length || page >= (paging.pages || 1)) break;
-      if (page === 5) capped = true;
+      if (page === maxPages) capped = true;
     }
     if (broadcast && capped) console.warn(`検索 経路=${label} 全体宛の検索が上限に達した、古い分は拾えていない`);
     console.log(`検索 経路=${label} 件数=${count}${broadcast ? ` 参加チャンネル分=${kept}` : ''}`); // 0 件の経路があれば、その検索は拾えていない
